@@ -55,6 +55,8 @@ After updating IconGen, update the pack once. Generated artwork is mapped to lau
 
 The automation switches control app updates, theme changes, and optional notifications. App updates rebuild, install, and apply the pack. Theme changes refresh it without rebuilding.
 
+Automatic pack updates wait 5 seconds for app installs/updates to settle. Another app change during that wait or generation restarts a 30-second quiet period. Pending waits recover after an app restart or reboot using the remaining delay. Manual generation starts immediately, but a later app update can supersede it before installation begins. Incoming app updates do not cancel an installation that has already started.
+
 Theme changes detected while the screen is off or the phone is locked stay pending until wake/unlock. This includes Battery Saver and Bedtime mode: refreshing Nothing Launcher's selector while it sleeps can leave icons using the previous theme. IconGen reapplies the pack after unlock without rebuilding it.
 
 Applying updated icons and theme refresh need Settings access. Choose PC or wireless setup.

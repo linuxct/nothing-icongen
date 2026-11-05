@@ -157,12 +157,16 @@ object BuildCoordinator {
             if (automatic) update { State(phase = Phase.QUEUED, message = "Waiting for app updates to finish") }
             else waitingForScheduler(context)
         }
-        schedule(context, settle)
+        schedule(context)
     }
 
-    /** The settle timer fired: no package change for the whole wait. */
+    /** A dispatched timer may be older than the latest package change; honor the saved deadline. */
     @Synchronized fun settled(context: Context) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(DEFER_UNTIL).commit()
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (!prefs.contains(DEFER_UNTIL) || prefs.getLong(REQUESTED, 0) <= prefs.getLong(COMPLETED, 0)) return
+        if (System.currentTimeMillis() >= prefs.getLong(DEFER_UNTIL, 0)) {
+            prefs.edit().remove(DEFER_UNTIL).commit()
+        }
         schedule(context)
     }
 
@@ -204,9 +208,11 @@ object BuildCoordinator {
         Log.d("BuildCoordinator", "Acknowledged generation=$request")
     }
 
-    /** Enqueue, rather than schedule: replacing a running job would cancel its build.
-     *  A settle delay goes to a separate timer job instead; rescheduling it restarts the wait. */
-    private fun schedule(context: Context, settleMs: Long = 0) {
+    /** Always schedule from the durable deadline, including recovery and early worker delivery.
+     *  Enqueue immediate work rather than replacing a running build; delayed work uses its own job. */
+    private fun schedule(context: Context) {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val settleMs = (prefs.getLong(DEFER_UNTIL, 0) - System.currentTimeMillis()).coerceAtLeast(0L)
         val scheduler = context.getSystemService(JobScheduler::class.java)
         val component = ComponentName(context, IconPackBuildJobService::class.java)
         val result = if (settleMs > 0) scheduler.schedule(JobInfo.Builder(SETTLE_JOB_ID, component)
@@ -252,8 +258,11 @@ object BuildCoordinator {
                 val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 target = prefs.getLong(REQUESTED, 0)
                 if (target <= prefs.getLong(COMPLETED, 0)) return
-                // Requests that arrived mid-build or on app start wait for the settle timer.
-                if (System.currentTimeMillis() < prefs.getLong(DEFER_UNTIL, 0)) return
+                // An early/redelivered worker must leave a future wakeup before completing its item.
+                if (System.currentTimeMillis() < prefs.getLong(DEFER_UNTIL, 0)) {
+                    schedule(context)
+                    return
+                }
                 if (prefs.getLong(MANUAL, 0) <= prefs.getLong(COMPLETED, 0) && !autoUpdateEnabled(context)) {
                     prefs.edit().putLong(COMPLETED, target).commit()
                     return
