@@ -36,8 +36,12 @@ object BuildCoordinator {
     private const val MANUAL = "manual"
     private const val CANCELLATION = "cancellation_generation"
     private const val STOPPED_MESSAGE = "stopped_message"
+    private const val DEFER_UNTIL = "defer_until"
+    private const val FIRST_SETTLE_MS = 5_000L
+    private const val BURST_SETTLE_MS = 30_000L
     private var active: Cancellation? = null
     const val JOB_ID = 4401
+    const val SETTLE_JOB_ID = 4404
 
     /** Captured before dispatch, so queued threads cannot escape a subsequent Stop. */
     class Cancellation internal constructor(
@@ -81,6 +85,19 @@ object BuildCoordinator {
             return block()
         }
 
+        private var installing = false
+
+        /** Cancelling inside install() leaves the pack waiting for a manual Install tap, so only before it. */
+        @Synchronized fun supersede(): Boolean {
+            if (!installing) cancel()
+            return !installing
+        }
+
+        @Synchronized fun beginInstall() {
+            checkpoint()
+            installing = true
+        }
+
         fun update(block: (State) -> State) {
             synchronized(BuildCoordinator) {
                 checkpoint()
@@ -122,13 +139,30 @@ object BuildCoordinator {
         if (automatic && (!OnboardingState.isComplete(context) || !autoUpdateEnabled(context))) return
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val next = prefs.getLong(REQUESTED, 0) + 1
+        val now = System.currentTimeMillis()
+        // Store updates install apps one by one. A change during the short wait or the build
+        // means a burst: drop the build and wait for a longer quiet gap.
+        val burst = automatic && (now < prefs.getLong(DEFER_UNTIL, 0) || state.isRunning)
+        val settle = if (!automatic) 0L else if (burst) BURST_SETTLE_MS else FIRST_SETTLE_MS
         val editor = prefs.edit().putLong(REQUESTED, next).remove(STOPPED_MESSAGE)
-        if (!automatic) editor.putLong(MANUAL, next)
+        if (automatic) editor.putLong(DEFER_UNTIL, now + settle) else editor.putLong(MANUAL, next).remove(DEFER_UNTIL)
         editor.commit()
-        Log.d("BuildCoordinator", "Requested generation=$next trigger=$trigger")
-        if (!state.isRunning && state.phase != Phase.WAITING_PERMISSION && state.phase != Phase.WAITING_CONFIRMATION) {
-            waitingForScheduler(context)
+        Log.d("BuildCoordinator", "Requested generation=$next trigger=$trigger settle=$settle")
+        if (burst && active?.supersede() == true) {
+            Log.d("BuildCoordinator", "Superseded running build; packages are still changing")
+            IconPackBuildService.cancelProgress(context)
+            update { State(phase = Phase.QUEUED, message = "Waiting for app updates to finish") }
         }
+        if (!state.isRunning && state.phase != Phase.WAITING_PERMISSION && state.phase != Phase.WAITING_CONFIRMATION) {
+            if (automatic) update { State(phase = Phase.QUEUED, message = "Waiting for app updates to finish") }
+            else waitingForScheduler(context)
+        }
+        schedule(context, settle)
+    }
+
+    /** The settle timer fired: no package change for the whole wait. */
+    @Synchronized fun settled(context: Context) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(DEFER_UNTIL).commit()
         schedule(context)
     }
 
@@ -142,7 +176,7 @@ object BuildCoordinator {
                 .putString(STOPPED_MESSAGE, "All generation stopped").commit()
             active?.cancel()
             update { State(phase = Phase.STOPPED, message = "All generation stopped") }
-            context.getSystemService(JobScheduler::class.java).cancel(JOB_ID)
+            context.getSystemService(JobScheduler::class.java).run { cancel(JOB_ID); cancel(SETTLE_JOB_ID) }
         }
         val message = IconPackInstaller.stopPending(context)
         synchronized(this) {
@@ -170,11 +204,14 @@ object BuildCoordinator {
         Log.d("BuildCoordinator", "Acknowledged generation=$request")
     }
 
-    /** Enqueue, rather than schedule: replacing a running job would cancel its build. */
-    private fun schedule(context: Context) {
-        val job = JobInfo.Builder(JOB_ID, ComponentName(context, IconPackBuildJobService::class.java))
-            .setOverrideDeadline(0).build()
-        val result = context.getSystemService(JobScheduler::class.java).enqueue(job, JobWorkItem(Intent()))
+    /** Enqueue, rather than schedule: replacing a running job would cancel its build.
+     *  A settle delay goes to a separate timer job instead; rescheduling it restarts the wait. */
+    private fun schedule(context: Context, settleMs: Long = 0) {
+        val scheduler = context.getSystemService(JobScheduler::class.java)
+        val component = ComponentName(context, IconPackBuildJobService::class.java)
+        val result = if (settleMs > 0) scheduler.schedule(JobInfo.Builder(SETTLE_JOB_ID, component)
+            .setMinimumLatency(settleMs).setOverrideDeadline(settleMs).build())
+        else scheduler.enqueue(JobInfo.Builder(JOB_ID, component).setOverrideDeadline(0).build(), JobWorkItem(Intent()))
         if (result != JobScheduler.RESULT_SUCCESS) update {
             it.copy(phase = Phase.FAILED, message = "Could not schedule icon pack update",
                 error = "Android rejected the build job; open the app to retry")
@@ -215,6 +252,8 @@ object BuildCoordinator {
                 val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 target = prefs.getLong(REQUESTED, 0)
                 if (target <= prefs.getLong(COMPLETED, 0)) return
+                // Requests that arrived mid-build or on app start wait for the settle timer.
+                if (System.currentTimeMillis() < prefs.getLong(DEFER_UNTIL, 0)) return
                 if (prefs.getLong(MANUAL, 0) <= prefs.getLong(COMPLETED, 0) && !autoUpdateEnabled(context)) {
                     prefs.edit().putLong(COMPLETED, target).commit()
                     return
@@ -229,7 +268,7 @@ object BuildCoordinator {
                 cancellation.checkpoint()
                 Log.d("BuildCoordinator", "Building generation=$target fingerprint=$fingerprint")
                 val apk = IconPackBuildService.build(context, cancellation)
-                cancellation.checkpoint()
+                cancellation.beginInstall()
                 IconPackInstaller.install(context, apk, target, fingerprint, cancellation)
             } catch (_: CancellationException) {
                 // Explicit Stop consumed the queue. Framework interruption leaves it durable

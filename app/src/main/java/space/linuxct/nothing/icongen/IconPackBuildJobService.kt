@@ -16,6 +16,10 @@ class IconPackBuildJobService : JobService() {
 
     override fun onStartJob(params: JobParameters): Boolean {
         Log.d("IconPackBuildJobService", "Job started id=${params.jobId}")
+        if (params.jobId == BuildCoordinator.SETTLE_JOB_ID) {
+            BuildCoordinator.settled(applicationContext)
+            return false
+        }
         val run = Run(params)
         runs[params.jobId] = run
         worker.execute {
