@@ -1,5 +1,10 @@
 package space.linuxct.nothing.icongen
 
+import android.Manifest
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.job.JobInfo
 import android.app.job.JobParameters
 import android.app.job.JobScheduler
@@ -7,384 +12,383 @@ import android.app.job.JobService
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
-import java.io.BufferedReader
-import java.io.InputStreamReader
+import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
-import java.util.zip.GZIPInputStream
+import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicBoolean
 
-/**
- * Optional daily GitHub release check for IconGen updates.
- * No auto-install; releases point users to GitHub + ADB instructions.
- */
+/** Optional stable-release checks. Installation always remains an explicit user action. */
 object AppUpdateChecker {
     private const val TAG = "AppUpdateChecker"
     const val CHANNEL_ID = "icongen_releases"
     private const val PREFS_KEY = "app_update_enabled"
     private const val DECISION_KEY = "app_update_decision"
-    private const val LAST_CHECK_KEY = "app_update_last_check"
-    private const val LAST_RELEASE_KEY = "app_update_last_release"
-    private const val JOB_ID = 4405
-    private const val INTERVAL_MS = 24L * 60 * 60 * 1000
+    // The old last_check/last_release keys recorded failed checks and merely seen releases.
+    private const val LAST_SUCCESS_KEY = "app_update_last_success"
+    private const val NOTIFIED_VERSION_KEY = "app_update_notified_version"
+    internal const val PERIODIC_JOB_ID = 4405
+    internal const val DUE_JOB_ID = 4406
+    internal const val INTERVAL_MS = 24L * 60 * 60 * 1000
+    private const val LATEST_URL = "https://api.github.com/repos/linuxct/nothing-icongen/releases/latest"
+    private const val RELEASE_URL_PREFIX = "https://github.com/linuxct/nothing-icongen/releases/tag/"
+    private const val DOWNLOAD_URL_PREFIX = "https://github.com/linuxct/nothing-icongen/releases/download/"
 
-    private val executor = Executors.newFixedThreadPool(2)
+    internal val executor = Executors.newFixedThreadPool(2)
+    private val main = Handler(Looper.getMainLooper())
+    // Guarded, like notification posting and preference changes, by NotificationPreferences.
+    private var generation = 0L
 
     private fun prefs(context: Context) =
         context.getSharedPreferences("app_update_prefs", Context.MODE_PRIVATE)
 
-    /** Whether update checks are enabled AND user has made a decision. */
     fun isEnabled(context: Context): Boolean =
         prefs(context).getBoolean(PREFS_KEY, false) && hasDecision(context)
 
-    /** Whether the user has explicitly accepted or declined. */
-    fun hasDecision(context: Context): Boolean =
-        prefs(context).contains(DECISION_KEY)
+    fun hasDecision(context: Context): Boolean = prefs(context).contains(DECISION_KEY)
 
-    /**
-     * Persist user choice. Schedules/cancels the periodic job accordingly.
-     * Also cancels any pending release notification.
-     */
-    fun setEnabled(context: Context, enabled: Boolean) {
-        val p = prefs(context)
-        p.edit().putBoolean(PREFS_KEY, enabled).putBoolean(DECISION_KEY, true).apply()
-        if (enabled) {
-            schedule(context)
-        } else {
-            cancel(context)
-            cancelNotification(context)
-        }
+    fun setEnabled(context: Context, enabled: Boolean) = synchronized(NotificationPreferences) {
+        prefs(context).edit().putBoolean(PREFS_KEY, enabled).putBoolean(DECISION_KEY, true).apply()
+        if (!enabled) generation++
+        sync(context)
     }
 
-    /** Ensure the periodic job is scheduled if enabled+decided. Idempotent. */
-    fun sync(context: Context) {
-        if (isEnabled(context)) {
-            schedule(context)
-        } else {
-            cancel(context)
-        }
-    }
+    /** KEEP existing schedules: repeatedly opening the app must not postpone either job. */
+    fun sync(context: Context) = sync(context, System.currentTimeMillis())
 
-    /** Ensure the release notification channel exists. */
-    fun ensureChannel(context: Context) {
-        val manager = context.getSystemService(android.app.NotificationManager::class.java)
-        val channel = android.app.NotificationChannel(
-            CHANNEL_ID,
-            "IconGen updates",
-            android.app.NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            setShowBadge(false)
-            lockscreenVisibility = android.app.Notification.VISIBILITY_PRIVATE
-        }
-        manager.createNotificationChannel(channel)
-    }
-
-    /** Cancel any notification for updates. */
-    fun cancelNotification(context: Context) {
-        context.getSystemService(android.app.NotificationManager::class.java)
-            .cancel(JOB_ID)
-    }
-
-    private fun schedule(context: Context) {
+    internal fun sync(context: Context, now: Long) = synchronized(NotificationPreferences) {
         val scheduler = context.getSystemService(JobScheduler::class.java)
-        val builder = JobInfo.Builder(JOB_ID, ComponentName(context, UpdateCheckJob::class.java))
-            .setPeriodic(INTERVAL_MS)
+        if (!isEnabled(context)) {
+            scheduler.cancel(PERIODIC_JOB_ID)
+            scheduler.cancel(DUE_JOB_ID)
+            cancelNotification(context)
+            return@synchronized
+        }
+        try {
+            if (scheduler.getPendingJob(PERIODIC_JOB_ID) == null) {
+                scheduler.schedule(jobBuilder(context, PERIODIC_JOB_ID).setPeriodic(INTERVAL_MS).build())
+            }
+            if (isDue(context, now) && scheduler.getPendingJob(DUE_JOB_ID) == null) {
+                scheduler.schedule(jobBuilder(context, DUE_JOB_ID)
+                    .setBackoffCriteria(30_000L, JobInfo.BACKOFF_POLICY_EXPONENTIAL).build())
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Scheduling failed", e)
+        }
+    }
+
+    private fun jobBuilder(context: Context, id: Int) =
+        JobInfo.Builder(id, ComponentName(context, UpdateCheckJob::class.java))
             .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
             .setPersisted(true)
-            .setRequiresDeviceIdle(false)
-            .setRequiresCharging(false)
-        try {
-            scheduler.schedule(builder.build())
-        } catch (e: Exception) {
-            Log.w(TAG, "Scheduling failed: ${e.message}")
-        }
+
+    fun isScheduled(context: Context): Boolean =
+        context.getSystemService(JobScheduler::class.java).getPendingJob(PERIODIC_JOB_ID) != null
+
+    internal fun isDue(context: Context, now: Long): Boolean {
+        val last = prefs(context).getLong(LAST_SUCCESS_KEY, 0)
+        return last <= 0 || now < last || now - last >= INTERVAL_MS
     }
 
-    private fun cancel(context: Context) {
-        try {
-            context.getSystemService(JobScheduler::class.java).cancel(JOB_ID)
-        } catch (_: Exception) {
-            // No-op
-        }
-    }
-
-    /** Check if a scheduled job exists for this app. */
-    fun isScheduled(context: Context): Boolean {
-        try {
-            val scheduler = context.getSystemService(JobScheduler::class.java)
-            val jobs = scheduler.getAllPendingJobs()
-            for (job in jobs) {
-                if (job.id == JOB_ID && job.service?.packageName == context.packageName) {
-                    return true
-                }
+    fun ensureChannel(context: Context) {
+        context.getSystemService(NotificationManager::class.java).createNotificationChannel(
+            NotificationChannel(CHANNEL_ID, "IconGen updates", NotificationManager.IMPORTANCE_LOW).apply {
+                setShowBadge(false)
+                lockscreenVisibility = Notification.VISIBILITY_PRIVATE
             }
-            return false
-        } catch (_: Exception) {
-            return false
-        }
+        )
     }
 
-    private fun lastCheckTime(context: Context): Long = prefs(context).getLong(LAST_CHECK_KEY, 0)
-    private fun lastReleaseTag(context: Context): String? = prefs(context).getString(LAST_RELEASE_KEY, null)
+    fun cancelNotification(context: Context) {
+        context.getSystemService(NotificationManager::class.java).cancel(PERIODIC_JOB_ID)
+    }
 
-    /**
-     * Release info for display. null means no check yet or failure.
-     */
     data class ReleaseInfo(
         val tagName: String,
         val title: String,
         val url: String,
-        val releasedAt: String
+        val releasedAt: String,
+        val version: String
     )
 
-    /**
-     * Fetch latest release from GitHub API.
-     * Returns latest non-draft release with an APK asset, or null.
-     */
-    internal fun fetchLatestRelease(): ReleaseInfo? {
+    sealed interface CheckResult {
+        data class Available(val release: ReleaseInfo) : CheckResult
+        data class Current(val installedVersion: String) : CheckResult
+        data object NoStableRelease : CheckResult
+        data class Failed(val reason: String) : CheckResult
+    }
+
+    /** Manual checks never consult or change automatic-check/notification preferences or throttles. */
+    fun checkNow(context: Context, callback: (CheckResult) -> Unit) {
+        val app = context.applicationContext
+        executor.execute {
+            val result = fetchAndCompare(app)
+            main.post { callback(result) }
+        }
+    }
+
+    private fun fetchAndCompare(context: Context): CheckResult = try {
+        val installed = context.packageManager.getPackageInfo(context.packageName, 0).versionName
+            ?: error("The installed app has no version name")
+        if (UpdateVersion.parse(installed) == null) {
+            CheckResult.Failed("The installed version could not be read: $installed")
+        } else {
+            fetchLatestRelease(installed)
+        }
+    } catch (e: Exception) {
+        Log.w(TAG, "Update check failed", e)
+        CheckResult.Failed(e.message ?: "Could not check GitHub for updates")
+    }
+
+    private fun fetchLatestRelease(installed: String): CheckResult {
+        val connection = URL(LATEST_URL).openConnection() as HttpURLConnection
         try {
-            val url = URL("https://api.github.com/repos/linuxct/nothing-icongen/releases?per_page=1")
-            val conn = url.openConnection() as HttpURLConnection
-            conn.requestMethod = "GET"
-            conn.connectTimeout = 10_000
-            conn.readTimeout = 15_000
-            conn.setRequestProperty("User-Agent", "IconGen-Android/1.0")
-            conn.setRequestProperty("Accept", "application/vnd.github.v3+json")
-
-            val code = conn.responseCode
-            if (code != 200) {
-                Log.w(TAG, "GitHub API returned: $code")
-                return null
-            }
-
-            val inputStream = conn.content?.let {
-                if (conn.contentEncoding?.contains("gzip", ignoreCase = true) == true) {
-                    GZIPInputStream(it as java.io.InputStream)
-                } else {
-                    it as java.io.InputStream
+            connection.requestMethod = "GET"
+            connection.connectTimeout = 10_000
+            connection.readTimeout = 15_000
+            connection.setRequestProperty("User-Agent", "IconGen-Android")
+            connection.setRequestProperty("Accept", "application/vnd.github+json")
+            return when (val status = connection.responseCode) {
+                HttpURLConnection.HTTP_OK -> connection.inputStream.bufferedReader().use {
+                    evaluateRelease(it.readText(), installed)
                 }
+                HttpURLConnection.HTTP_NOT_FOUND -> CheckResult.NoStableRelease
+                else -> CheckResult.Failed("GitHub returned HTTP $status. Please try again later.")
             }
+        } finally {
+            connection.disconnect()
+        }
+    }
 
-            val reader = BufferedReader(InputStreamReader(inputStream ?: conn.inputStream as java.io.InputStream))
-            val json = reader.readText()
+    /** Read only root release metadata; asset names/uploader URLs cannot overwrite it. */
+    internal fun parseRelease(json: String): ReleaseInfo? {
+        val root = JSONObject(json)
+        if (root.getBoolean("draft") || root.getBoolean("prerelease")) return null
+        val tag = root.getString("tag_name")
+        val version = UpdateVersion.fromTag(tag) ?: return null
+        val assets = root.getJSONArray("assets")
+        val hasApk = (0 until assets.length()).any { index ->
+            val asset = assets.getJSONObject(index)
+            asset.optString("name").endsWith(".apk", ignoreCase = true) &&
+                asset.optString("browser_download_url").startsWith(DOWNLOAD_URL_PREFIX)
+        }
+        if (!hasApk) return null
+        val url = root.getString("html_url")
+        require(url.startsWith(RELEASE_URL_PREFIX)) { "GitHub returned an invalid release link" }
+        return ReleaseInfo(tag, root.optString("name").ifBlank { tag }, url,
+            root.getString("published_at"), version.text)
+    }
 
-            val releases = parseReleases(json)
-            if (releases.isEmpty()) return null
+    internal fun evaluateRelease(json: String, installedVersion: String): CheckResult = try {
+        val installed = UpdateVersion.parse(installedVersion)
+            ?: error("The installed version could not be read: $installedVersion")
+        val release = parseRelease(json)
+        when {
+            release == null -> CheckResult.NoStableRelease
+            UpdateVersion.parse(release.version)!! > installed -> CheckResult.Available(release)
+            else -> CheckResult.Current(installedVersion)
+        }
+    } catch (e: Exception) {
+        CheckResult.Failed(e.message ?: "GitHub returned an invalid release")
+    }
 
-            // Take first (most recent) release with an APK asset
-            for (release in releases) {
-                if (release.draft) continue
-                if (release.apkUrl.isNullOrEmpty()) continue
-                return ReleaseInfo(
-                    tagName = release.tagName,
-                    title = release.title,
-                    url = release.url,
-                    releasedAt = release.publishedAt
-                )
-            }
-            return null
+    internal fun automaticGeneration(): Long = synchronized(NotificationPreferences) { generation }
+
+    internal fun automaticAllowed(context: Context, expectedGeneration: Long): Boolean =
+        synchronized(NotificationPreferences) { isEnabled(context) && generation == expectedGeneration }
+
+    /** Returns whether a finite automatic job needs scheduler backoff; failures consume no interval. */
+    internal fun checkAutomatically(
+        context: Context,
+        now: Long = System.currentTimeMillis(),
+        isActive: () -> Boolean = { true },
+        fetch: () -> CheckResult = { fetchAndCompare(context) }
+    ): Boolean {
+        synchronized(NotificationPreferences) {
+            if (!isActive() || !isEnabled(context) || !isDue(context, now)) return false
+        }
+        val result = try {
+            fetch()
         } catch (e: Exception) {
-            Log.w(TAG, "Fetch failed", e)
-            return null
+            CheckResult.Failed(e.message ?: "Update check failed")
         }
-    }
-
-    private data class RawRelease(
-        val tagName: String,
-        val title: String,
-        val url: String,
-        val publishedAt: String,
-        val draft: Boolean,
-        val apkUrl: String?
-    )
-
-    private fun parseReleases(json: String): List<RawRelease> {
-        val releases = mutableListOf<RawRelease>()
-        var depth = 0
-        var objStart = -1
-        var inString = false
-
-        for (i in json.indices) {
-            val ch = json[i]
-            when {
-                ch == '"' -> {
-                    inString = !inString
-                }
-                inString -> continue
-                ch == '{' -> {
-                    depth++
-                    if (depth == 1) objStart = i
-                }
-                ch == '}' -> {
-                    depth--
-                    if (depth == 0 && objStart >= 0) {
-                        val obj = json.substring(objStart, i + 1)
-                        releases.add(parseSingleRelease(obj))
-                        objStart = -1
+        return synchronized(NotificationPreferences) {
+            if (!isActive() || !isEnabled(context)) return@synchronized false
+            when (result) {
+                is CheckResult.Failed -> true
+                is CheckResult.Available -> {
+                    val previouslyNotified = prefs(context).getString(NOTIFIED_VERSION_KEY, null)
+                        ?.let(UpdateVersion::parse)
+                    val version = UpdateVersion.parse(result.release.version)!!
+                    val delivered = previouslyNotified?.compareTo(version) == 0 ||
+                        postReleaseNotification(context, result.release)
+                    if (delivered) {
+                        prefs(context).edit().putLong(LAST_SUCCESS_KEY, now)
+                            .putString(NOTIFIED_VERSION_KEY, result.release.version).apply()
                     }
+                    // A blocked notification stays due for the next start/permission recovery.
+                    false
+                }
+                else -> {
+                    cancelNotification(context)
+                    prefs(context).edit().putLong(LAST_SUCCESS_KEY, now).apply()
+                    false
                 }
             }
         }
-        return releases
     }
 
-    private fun parseSingleRelease(obj: String): RawRelease {
-        var tagName = ""; var title = ""; var url = ""; var publishedAt = ""; var draft = false; var apkUrl: String? = null
-
-        var i = 0
-        while (i < obj.length) {
-            val keyIdx = obj.indexOf("\"", i)
-            if (keyIdx < 0) break
-            val keyEnd = obj.indexOf("\"", keyIdx + 1)
-            if (keyEnd < 0) break
-            val key = obj.substring(keyIdx + 1, keyEnd)
-            i = keyEnd + 1
-
-            while (i < obj.length && obj[i] in " \n\r\t:") i++
-
-            if (i < obj.length && obj[i] == '"') {
-                i++
-                val valueStart = i
-                while (i < obj.length && obj[i] != '"') {
-                    if (obj[i] == '\\') i++
-                    i++
-                }
-                val value = obj.substring(valueStart, i)
-                when (key) {
-                    "tag_name" -> tagName = value
-                    "name" -> title = value
-                    "html_url" -> url = value
-                    "published_at" -> publishedAt = value
-                    "draft" -> draft = value.toBoolean()
-                }
-                i++
-            } else {
-                val valueStart = i
-                while (i < obj.length && obj[i] !in "\"{},] \n\r\t:") i++
-                val valueStr = obj.substring(valueStart, i)
-                if (key == "draft") draft = valueStr == "true"
-            }
-        }
-
-        // Extract assets - find the APK download URL
-        val assetsIdx = obj.indexOf("\"assets\"")
-        if (assetsIdx >= 0) {
-            val assetsStart = obj.indexOf("[", assetsIdx)
-            if (assetsStart > assetsIdx) {
-                val assetsEnd = obj.indexOf("]", assetsStart)
-                if (assetsEnd > assetsStart) {
-                    val assets = obj.substring(assetsStart, assetsEnd + 1)
-                    // Find browser_download_url near .apk
-                    val apkIdx = assets.lastIndexOf(".apk")
-                    if (apkIdx > 0) {
-                        val searchEnd = minOf(apkIdx, assets.length - 20)
-                        val urlIdx = assets.lastIndexOf("\"browser_download_url\"", searchEnd)
-                        if (urlIdx > 0) {
-                            val quoteStart = assets.indexOf("\"", urlIdx + 21)
-                            val quoteEnd = assets.indexOf("\"", quoteStart + 1)
-                            if (quoteEnd > quoteStart) {
-                                apkUrl = assets.substring(quoteStart + 1, quoteEnd)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        return RawRelease(tagName, title, url, publishedAt, draft, apkUrl)
-    }
-
-    /**
-     * Perform the actual check. Returns true if a new release was found (and notification posted).
-     */
-    internal fun check(context: Context): Boolean {
+    /** Caller holds NotificationPreferences so opting out cannot race with a late notification. */
+    private fun postReleaseNotification(context: Context, release: ReleaseInfo): Boolean {
+        if (!NotificationPreferences.isEnabled(context)) return false
+        val manager = context.getSystemService(NotificationManager::class.java)
         ensureChannel(context)
-
-        if (!NotificationPreferences.isEnabled(context)) {
-            prefs(context).edit().putLong(LAST_CHECK_KEY, System.currentTimeMillis()).apply()
-            return false
+        if (!manager.areNotificationsEnabled() ||
+            manager.getNotificationChannel(CHANNEL_ID)?.importance == NotificationManager.IMPORTANCE_NONE ||
+            (Build.VERSION.SDK_INT >= 33 &&
+                context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+        ) return false
+        return try {
+            val intent = PendingIntent.getActivity(context, PERIODIC_JOB_ID,
+                Intent(Intent.ACTION_VIEW, Uri.parse(release.url)),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+            val notification = Notification.Builder(context, CHANNEL_ID)
+                .setContentTitle("IconGen update available")
+                .setContentText(release.title)
+                .setSmallIcon(R.drawable.ic_launcher_monochrome)
+                .setContentIntent(intent)
+                .setAutoCancel(true)
+                .setOnlyAlertOnce(true)
+                .build()
+            manager.notify(PERIODIC_JOB_ID, notification)
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not post release notification", e)
+            false
         }
-
-        val currentReleaseTag = lastReleaseTag(context)
-        val now = System.currentTimeMillis()
-        val lastCheck = lastCheckTime(context)
-
-        // Only check if enough time has passed
-        if (now - lastCheck < INTERVAL_MS && lastCheck > 0) {
-            return false
-        }
-
-        val release = fetchLatestRelease() ?: run {
-            prefs(context).edit().putLong(LAST_CHECK_KEY, now).apply()
-            return false
-        }
-
-        prefs(context).edit()
-            .putLong(LAST_CHECK_KEY, now)
-            .putString(LAST_RELEASE_KEY, release.tagName)
-            .apply()
-
-        if (release.tagName == currentReleaseTag) {
-            return false
-        }
-
-        postReleaseNotification(context, release)
-        return true
-    }
-
-    private fun postReleaseNotification(context: Context, release: ReleaseInfo) {
-        val notificationManager = context.getSystemService(android.app.NotificationManager::class.java)
-        val pendingIntent = android.app.PendingIntent.getActivity(
-            context,
-            0,
-            Intent(Intent.ACTION_VIEW, android.net.Uri.parse(release.url)),
-            android.app.PendingIntent.FLAG_UPDATE_CURRENT or
-                if (Build.VERSION.SDK_INT >= 31) android.app.PendingIntent.FLAG_MUTABLE else 0
-        )
-
-        val notification = android.app.Notification.Builder(context, CHANNEL_ID)
-            .setContentTitle("IconGen update available")
-            .setContentText(release.title)
-            .setSmallIcon(android.R.drawable.sym_action_call)
-            .setContentIntent(pendingIntent)
-            .setAutoCancel(true)
-            .setPriority(android.app.Notification.PRIORITY_LOW)
-            .setOnlyAlertOnce(true)
-            .build()
-
-        notificationManager.notify(JOB_ID, notification)
     }
 }
 
-/**
- * JobService that runs the daily release check.
- * Must be registered in manifest with RECEIVE_BOOT_COMPLETED to survive reboots.
- */
-class UpdateCheckJob : JobService() {
-    companion object {
-        private const val TAG = "UpdateCheckJob"
+/** Numeric core components (including IconGen's fourth component) plus SemVer suffix precedence. */
+internal class UpdateVersion private constructor(
+    val text: String,
+    private val core: List<String>,
+    private val prerelease: List<String>
+) : Comparable<UpdateVersion> {
+    override fun compareTo(other: UpdateVersion): Int {
+        for (index in 0 until maxOf(core.size, other.core.size)) {
+            val difference = compareNumeric(core.getOrElse(index) { "0" }, other.core.getOrElse(index) { "0" })
+            if (difference != 0) return difference
+        }
+        if (prerelease.isEmpty()) return if (other.prerelease.isEmpty()) 0 else 1
+        if (other.prerelease.isEmpty()) return -1
+        for (index in 0 until minOf(prerelease.size, other.prerelease.size)) {
+            val left = prerelease[index]
+            val right = other.prerelease[index]
+            val leftNumeric = left.all(Char::isDigit)
+            val rightNumeric = right.all(Char::isDigit)
+            val difference = when {
+                leftNumeric && rightNumeric -> compareNumeric(left, right)
+                leftNumeric -> -1
+                rightNumeric -> 1
+                else -> left.compareTo(right)
+            }
+            if (difference != 0) return difference
+        }
+        return prerelease.size.compareTo(other.prerelease.size)
     }
-    override fun onStartJob(params: JobParameters): Boolean {
-        if (!AppUpdateChecker.isEnabled(this@UpdateCheckJob)) {
-            jobFinished(params, false)
-            return false
+
+    companion object {
+        private val syntax = Regex("^(0|[1-9][0-9]*)(\\.(0|[1-9][0-9]*)){2,}(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$")
+        private val buildTag = Regex("^build-(.+)-[0-9]+\\.[0-9]+$")
+
+        fun fromTag(tag: String): UpdateVersion? {
+            val version = if (tag.startsWith("build-")) {
+                buildTag.matchEntire(tag)?.groupValues?.get(1) ?: return null
+            } else tag
+            return parse(version)
         }
 
-        Thread {
-            try {
-                AppUpdateChecker.check(this@UpdateCheckJob)
+        fun parse(value: String): UpdateVersion? {
+            val text = value.removePrefix("v")
+            if (!syntax.matches(text)) return null
+            val withoutMetadata = text.substringBefore('+')
+            val core = withoutMetadata.substringBefore('-').split('.')
+            val prerelease = withoutMetadata.substringAfter('-', "").takeIf { it.isNotEmpty() }
+                ?.split('.') ?: emptyList()
+            if (prerelease.any { it.all(Char::isDigit) && it.length > 1 && it.startsWith('0') }) return null
+            return UpdateVersion(text, core, prerelease)
+        }
+
+        private fun compareNumeric(left: String, right: String): Int {
+            val length = left.length.compareTo(right.length)
+            return if (length != 0) length else left.compareTo(right)
+        }
+    }
+}
+
+/** Periodic wakeups enqueue finite work; only finite failures request scheduler backoff. */
+class UpdateCheckJob : JobService() {
+    private class Work(val generation: Long) {
+        val active = AtomicBoolean(true)
+        var future: Future<*>? = null
+    }
+
+    private val work = mutableMapOf<Int, Work>()
+    private val main = Handler(Looper.getMainLooper())
+
+    override fun onStartJob(params: JobParameters): Boolean {
+        if (!AppUpdateChecker.isEnabled(this)) return false
+        if (params.jobId == AppUpdateChecker.PERIODIC_JOB_ID) {
+            AppUpdateChecker.sync(this)
+            return false
+        }
+        if (params.jobId != AppUpdateChecker.DUE_JOB_ID) return false
+        val task = Work(AppUpdateChecker.automaticGeneration())
+        work.put(params.jobId, task)?.let(::revoke)
+        task.future = AppUpdateChecker.executor.submit {
+            val retry = try {
+                AppUpdateChecker.checkAutomatically(this, isActive = {
+                    task.active.get() && AppUpdateChecker.automaticAllowed(this, task.generation)
+                })
             } catch (e: Exception) {
-                Log.e(TAG, "Check failed", e)
-            } finally {
-                jobFinished(params, false)
+                Log.w("UpdateCheckJob", "Background update check failed", e)
+                true
             }
-        }.start()
+            main.post {
+                if (work[params.jobId] === task) {
+                    work.remove(params.jobId)
+                    if (task.active.getAndSet(false) &&
+                        AppUpdateChecker.automaticAllowed(this, task.generation)) {
+                        jobFinished(params, retry)
+                    }
+                }
+            }
+        }
         return true
     }
 
     override fun onStopJob(params: JobParameters): Boolean {
-        return false
+        work.remove(params.jobId)?.let(::revoke)
+        return params.jobId == AppUpdateChecker.DUE_JOB_ID && AppUpdateChecker.isEnabled(this)
+    }
+
+    override fun onDestroy() {
+        work.values.forEach(::revoke)
+        work.clear()
+        super.onDestroy()
+    }
+
+    private fun revoke(task: Work) = synchronized(NotificationPreferences) {
+        task.active.set(false)
+        task.future?.cancel(true)
+        Unit
     }
 }

@@ -15,6 +15,9 @@ object NotificationPreferences {
     fun setEnabled(context: Context, enabled: Boolean) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putBoolean(ENABLED, enabled).apply()
-        if (!enabled) IconPackBuildService.cancelNotifications(context)
+        if (!enabled) {
+            IconPackBuildService.cancelNotifications(context)
+            AppUpdateChecker.cancelNotification(context)
+        }
     }
 }

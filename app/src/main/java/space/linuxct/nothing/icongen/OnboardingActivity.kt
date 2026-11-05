@@ -113,7 +113,7 @@ class OnboardingActivity : AppCompatActivity() {
         ui.toggle(choices, "Theme changes", "Refresh selected icons when light or dark mode changes; no rebuild needed.", draft.themeChanges) {
             save { current -> current.copy(themeChanges = it) }
         }
-        ui.toggle(choices, "IconGen updates", "Check GitHub once a day for new IconGen releases. Notifications must be enabled to see update alerts.", draft.appReleaseUpdates) {
+        ui.toggle(choices, "IconGen updates", "Check GitHub for newer stable releases about once a day. Enable notifications for update alerts; manual checks are also available in the menu.", draft.appReleaseUpdates) {
             save { current -> current.copy(appReleaseUpdates = it) }
         }
         ui.toggle(choices, "Notifications", "Optional build progress and results. Not required for app-update detection.", draft.notifications, last = true) {

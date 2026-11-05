@@ -1,8 +1,10 @@
 package space.linuxct.nothing.icongen
 
 import android.Manifest
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
@@ -26,6 +28,8 @@ class MainActivity : AppCompatActivity() {
     private var details = ""
     private var setupDialog: android.app.Dialog? = null
     private var updateConsentDialog: android.app.Dialog? = null
+    private var manualUpdateDialog: android.app.Dialog? = null
+    private var manualUpdateInFlight = false
     private var builtApk: File? = null
     private var activityResumed = false
     private var resumingInstall = false
@@ -126,7 +130,7 @@ class MainActivity : AppCompatActivity() {
             ThemeRefreshController.setEnabled(this, enabled)
             refreshThemeAccess()
         }
-        ui.toggle(automationCard, "IconGen updates", "Check GitHub once a day for new IconGen releases", AppUpdateChecker.isEnabled(this), last = true) { enabled ->
+        ui.toggle(automationCard, "IconGen updates", "Check GitHub for stable releases about once a day; Check for updates is also in the menu", AppUpdateChecker.isEnabled(this), last = true) { enabled ->
             AppUpdateChecker.setEnabled(this, enabled)
         }
     }
@@ -136,12 +140,13 @@ class MainActivity : AppCompatActivity() {
             if (!activityResumed || isFinishing || isDestroyed ||
                 !OnboardingState.isComplete(this) || AppUpdateChecker.hasDecision(this) ||
                 !window.decorView.hasWindowFocus() || updateConsentDialog?.isShowing == true ||
-                setupDialog?.isShowing == true || setupPrefs.getBoolean(KEY_FLOW_ACTIVE, false) ||
+                setupDialog?.isShowing == true || manualUpdateDialog?.isShowing == true ||
+                setupPrefs.getBoolean(KEY_FLOW_ACTIVE, false) ||
                 setupPrefs.contains(KEY_AWAITING) || intent.getBooleanExtra(EXTRA_THEME_ACCESS, false)
             ) return@post
             updateConsentDialog = ui.dialog(this, "IconGen updates") { content, dialog ->
-                ui.add(content, ui.text("Allow IconGen to contact GitHub in the background once every 24 hours to check for new IconGen releases? Android may delay these checks. No checks run unless you enable this option.", 14f))
-                ui.add(content, ui.text("When optional notifications are enabled, a new release can show an alert linking to GitHub. Updates are never installed automatically: installing IconGen requires a PC and the ADB bypass. You can change this choice in Automation.", 13f, muted = true), 12)
+                ui.add(content, ui.text("Allow IconGen to contact GitHub in the background about once every 24 hours to check for new stable IconGen releases? Android may delay these checks. Background checks stay off unless you enable this option; Check for updates in the menu always works manually.", 14f))
+                ui.add(content, ui.text("When optional notifications are enabled and allowed by Android, a newer stable release can show an alert linking to GitHub. Updates are never installed automatically. Install using a PC with the ADB bypass, or on your phone with InstallerX Revived and Shizuku. You can change background checks in Automation.", 13f, muted = true), 12)
                 ui.add(content, ui.button("Enable", primary = true) {
                     AppUpdateChecker.setEnabled(this, true)
                     dialog.dismiss()
@@ -206,8 +211,86 @@ class MainActivity : AppCompatActivity() {
                 ui.add(content, ui.row("Reinstall icon pack", "Install the last generated pack") { dialog.dismiss(); requestOperation(ACTION_INSTALL) })
             }
             ui.add(content, ui.row("Build details", "Status and diagnostic information") { dialog.dismiss(); showBuildDetails() })
+            ui.add(content, ui.row("Check for updates", "Check GitHub’s latest stable IconGen release") { dialog.dismiss(); checkForUpdates() })
             ui.add(content, ui.button("Done") { dialog.dismiss() }, 12)
         }
+    }
+
+    private fun checkForUpdates() {
+        if (!activityResumed || isFinishing || isDestroyed) return
+        if (manualUpdateInFlight) {
+            Toast.makeText(this, "An update check is already running.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (manualUpdateDialog?.isShowing == true) return
+
+        manualUpdateInFlight = true
+        lateinit var resultContent: LinearLayout
+        val dialog = ui.dialog(this, "IconGen updates") { content, checkingDialog ->
+            resultContent = ui.column()
+            ui.add(content, resultContent)
+            ui.add(resultContent, ui.text("Checking GitHub’s latest stable release…", 14f).apply {
+                accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+            })
+            ui.add(resultContent, ui.text("Background checks and notification settings will not change.", 13f, muted = true), 12)
+            ui.add(resultContent, ui.button("Cancel") { dismissManualUpdateDialog() }, 20)
+        }
+        manualUpdateDialog = dialog
+        // Invalidate immediately on Back/outside taps, before the dialog's exit animation.
+        dialog.setOnCancelListener {
+            if (manualUpdateDialog === dialog) manualUpdateDialog = null
+        }
+        dialog.setOnDismissListener {
+            if (manualUpdateDialog === dialog) manualUpdateDialog = null
+        }
+        AppUpdateChecker.checkNow(this) { result ->
+            manualUpdateInFlight = false
+            if (!activityResumed || isFinishing || isDestroyed ||
+                manualUpdateDialog !== dialog || !dialog.isShowing
+            ) return@checkNow
+
+            resultContent.removeAllViews()
+            when (result) {
+                is AppUpdateChecker.CheckResult.Available -> {
+                    val release = result.release
+                    val installedVersion = packageManager.getPackageInfo(packageName, 0).versionName ?: "Unknown"
+                    ui.add(resultContent, ui.text("Update available", 18f))
+                    ui.add(resultContent, ui.text("Installed: $installedVersion\nLatest stable: ${release.version}", 14f), 12)
+                    ui.add(resultContent, ui.text(release.title, 14f), 12)
+                    ui.add(resultContent, ui.text("View the release and installation instructions on GitHub. Install using a PC with the ADB bypass, or on your phone with InstallerX Revived and Shizuku. Nothing is installed automatically.", 13f, muted = true), 12)
+                    ui.add(resultContent, ui.button("View update", primary = true) {
+                        try {
+                            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(release.url)))
+                            dismissManualUpdateDialog()
+                        } catch (_: ActivityNotFoundException) {
+                            Toast.makeText(this, "No app can open the release page.", Toast.LENGTH_LONG).show()
+                        }
+                    }, 20)
+                    ui.add(resultContent, ui.button("Not now") { dismissManualUpdateDialog() }, 8)
+                }
+                is AppUpdateChecker.CheckResult.Current -> {
+                    ui.add(resultContent, ui.text("You’re up to date", 18f))
+                    ui.add(resultContent, ui.text("Installed: ${result.installedVersion}\nNo newer stable IconGen release is available.", 14f), 12)
+                }
+                AppUpdateChecker.CheckResult.NoStableRelease -> {
+                    ui.add(resultContent, ui.text("No stable release available", 18f))
+                    ui.add(resultContent, ui.text("GitHub has no latest stable IconGen release to compare with your installed version.", 14f), 12)
+                }
+                is AppUpdateChecker.CheckResult.Failed -> {
+                    ui.add(resultContent, ui.text("Couldn’t check for updates", 18f))
+                    ui.add(resultContent, ui.text("Your update status could not be determined. Try again later.\n\n${result.reason}", 14f), 12)
+                }
+            }
+            if (result !is AppUpdateChecker.CheckResult.Available) {
+                ui.add(resultContent, ui.button("Done") { dismissManualUpdateDialog() }, 20)
+            }
+        }
+    }
+
+    private fun dismissManualUpdateDialog() {
+        val dialog = manualUpdateDialog
+        manualUpdateDialog = null
+        dialog?.dismiss()
     }
 
     private fun showBuildDetails() {
@@ -524,6 +607,7 @@ class MainActivity : AppCompatActivity() {
         syncInstallState()
         advancePermissionSetup()
         BackgroundMonitorService.sync(this)
+        AppUpdateChecker.sync(this)
         if (intent.getBooleanExtra(EXTRA_THEME_ACCESS, false)) {
             intent.removeExtra(EXTRA_THEME_ACCESS)
             showSettingsAccessInstructions()
@@ -538,11 +622,13 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         activityResumed = false
+        dismissManualUpdateDialog()
         BuildCoordinator.removeListener(buildListener)
         super.onPause()
     }
 
     override fun onDestroy() {
+        dismissManualUpdateDialog()
         IconPackInstaller.statusListener = null
         super.onDestroy()
     }
