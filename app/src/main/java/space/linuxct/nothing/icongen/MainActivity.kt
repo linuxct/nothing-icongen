@@ -126,6 +126,10 @@ class MainActivity : AppCompatActivity() {
             ThemeRefreshController.setEnabled(this, enabled)
             refreshThemeAccess()
         }
+        ui.toggle(automationCard, "Keep theme on app updates", "Apps stay themed after update without rebuild, but are themed system-wide which looks off", IconPackAssembler.keepThemeOnUpdate(this)) { enabled ->
+            IconPackAssembler.setKeepThemeOnUpdate(this, enabled)
+            requestOperation(ACTION_GENERATE)
+        }
         ui.toggle(automationCard, "IconGen updates", "Check GitHub once a day for new IconGen releases", AppUpdateChecker.isEnabled(this), last = true) { enabled ->
             AppUpdateChecker.setEnabled(this, enabled)
         }

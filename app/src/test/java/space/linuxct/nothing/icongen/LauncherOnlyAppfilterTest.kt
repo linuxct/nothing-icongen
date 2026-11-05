@@ -99,4 +99,25 @@ class LauncherOnlyAppfilterTest {
             output.deleteRecursively()
         }
     }
+
+    @Test fun keepThemeOnUpdateDropsPackageDefaults() {
+        val context = RuntimeEnvironment.getApplication()
+        val output = File(context.cacheDir, "keep-theme-appfilter")
+        val glyph = Bitmap.createBitmap(IconArtwork.ICON_SIZE, IconArtwork.ICON_SIZE, Bitmap.Config.ARGB_8888)
+        IconPackAssembler.setKeepThemeOnUpdate(context, true)
+        try {
+            IconPackAssembler.assembleZip(
+                context, output,
+                listOf(IconPackAssembler.PackEntry("example.app/example.app.Main", "App", LauncherGlyphs(glyph))),
+                ThemeColors.Palette(0xFF272B2D.toInt(), 0x66FFFFFF, false),
+            ).delete()
+            val appfilter = File(output, "res/xml/appfilter.xml").readText()
+            assertTrue(appfilter.contains("ComponentInfo{example.app/example.app.Main}"))
+            assertTrue("No package-wide default expected", !appfilter.contains("ComponentInfo{example.app/}"))
+        } finally {
+            IconPackAssembler.setKeepThemeOnUpdate(context, false)
+            glyph.recycle()
+            output.deleteRecursively()
+        }
+    }
 }

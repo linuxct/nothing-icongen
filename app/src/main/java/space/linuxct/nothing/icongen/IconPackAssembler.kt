@@ -34,6 +34,15 @@ object IconPackAssembler {
     private const val TARGET_SDK = 37
     internal const val PACKAGE_NAME = "com.nothing.icongen.pack"
     const val COMPILE_DIR_PREFIX = "apk_compile_"
+    private const val PREFS = "pack_options"
+    private const val KEY_KEEP_THEME_ON_UPDATE = "keep_theme_on_update"
+
+    fun keepThemeOnUpdate(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_KEEP_THEME_ON_UPDATE, false)
+
+    fun setKeepThemeOnUpdate(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_KEEP_THEME_ON_UPDATE, enabled).apply()
+    }
 
     data class PackEntry(
         val componentName: String,
@@ -281,11 +290,13 @@ object IconPackAssembler {
     <iconback img1="icon_background" />
 """)
         val packages = HashSet<String>()
+        val launcherOnly = !keepThemeOnUpdate(context)
         for (entry in entries) {
             val packageName = entry.componentName.substringBefore('/')
-            if (packages.add(packageName)) {
+            if (launcherOnly && packages.add(packageName)) {
                 // Empty package defaults opt out of package-wide theming; exact activity
                 // overrides below still resolve to their generated launcher drawables.
+                // The launcher also hits them when an app updates, dropping its theme until a rebuild.
                 appfilterXml.append(
                     "    <item component=\"ComponentInfo{$packageName/}\" drawable=\"\" />\n",
                 )
