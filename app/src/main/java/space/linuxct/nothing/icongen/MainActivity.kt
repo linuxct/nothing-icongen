@@ -226,7 +226,7 @@ class MainActivity : AppCompatActivity() {
                 ui.add(content, ui.row("Reinstall icon pack", "Install the last generated pack") { dialog.dismiss(); requestOperation(ACTION_INSTALL) })
             }
             ui.add(content, ui.row("Build details", "Status and diagnostic information") { dialog.dismiss(); showBuildDetails() })
-            ui.add(content, ui.row("IconGen update status", "Check for updates or view installation progress") {
+            ui.add(content, ui.row("IconGen updates", "Check for updates or view installation progress") {
                 dialog.dismiss()
                 openIconGenUpdateStatus()
             })
