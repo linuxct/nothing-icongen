@@ -66,7 +66,17 @@
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="User-initiated wireless debugging pairing through a notification reply to grant IconGen Settings access" />
+                android:value="User-initiated wireless debugging pairing through a notification reply to authorize updates or grant IconGen Settings access" />
+        </service>
+
+        <service
+            android:name=".AppSelfUpdateService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Downloads and verifies signed IconGen updates and installs them through this phone's authorized wireless ADB connection" />
         </service>
 
         <receiver

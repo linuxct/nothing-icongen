@@ -9,6 +9,7 @@ class BackgroundMonitorReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         when (intent.action) {
             Intent.ACTION_BOOT_COMPLETED, Intent.ACTION_MY_PACKAGE_REPLACED -> {
+                AppSelfUpdater.recover(context)
                 PackageChangeMonitor.register(context)
                 BackgroundMonitorService.sync(context, refresh = true)
                 AppUpdateChecker.sync(context)

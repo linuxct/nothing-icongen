@@ -17,8 +17,12 @@ import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
 import java.io.Closeable
 import java.io.DataInputStream
+import java.io.ByteArrayInputStream
+import java.io.EOFException
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
 import java.math.BigInteger
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -31,6 +35,9 @@ import java.security.PrivateKey
 import java.security.SecureRandom
 import java.security.cert.Certificate
 import java.util.Date
+import java.util.Timer
+import java.util.TimerTask
+import java.util.UUID
 import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeUnit
 
@@ -124,6 +131,112 @@ internal class WirelessAdbClient(private val context: Context) {
 
     fun grant(endpoint: WirelessAdbEndpoint): WirelessGrantStatus = run(endpoint, requireAdbTls = true) { port ->
         check(context.packageName == PACKAGE) { "Unexpected application package; grants were not executed." }
+        val connection = connect(port)
+        try {
+            execute(connection, "pm grant $PACKAGE android.permission.WRITE_SECURE_SETTINGS")
+            checkCancelled()
+            execute(connection, "appops set $PACKAGE WRITE_SETTINGS allow")
+            checkCancelled()
+            val status = WirelessGrantStatus.read(context)
+            check(status.complete) {
+                "ADB commands finished, but Android did not confirm both grants.\n${status.describe()}"
+            }
+            WirelessAdbAccess.remember(context, endpoint)
+            status
+        } finally {
+            // Close the relay first so upstream's connection-thread join cannot wait on network I/O.
+            relay?.close()
+            connection.close()
+        }
+    }
+
+    /** Verify a fresh ADB authorization without restoring any Android Settings permissions. */
+    fun authorize(endpoint: WirelessAdbEndpoint) = run(endpoint, requireAdbTls = true) { port ->
+        check(context.packageName == PACKAGE) { "Unexpected application package; authorization was not checked." }
+        val connection = connect(port)
+        try {
+            checkCancelled()
+            WirelessAdbAccess.remember(context, endpoint)
+        } finally {
+            relay?.close()
+            connection.close()
+        }
+    }
+
+    /**
+     * The uploaded APK has already been authenticated by the updater. This transport never accepts
+     * a caller-supplied shell command, remote filename, or package installer argument.
+     */
+    fun install(endpoint: WirelessAdbEndpoint, apk: File, beforeCommit: () -> Unit) {
+        require(apk.isFile && apk.length() in 1..AdbSyncTransfer.MAX_FILE_SIZE) {
+            "The verified update APK is missing or too large."
+        }
+        var authenticated = false
+        val deadline = Timer("IconGen-adb-install-deadline", true)
+        deadline.schedule(object : TimerTask() {
+            override fun run() = cancel("Wireless ADB installation timed out; check the installed version before retrying.")
+        }, 180_000)
+        try {
+            run(endpoint, requireAdbTls = true) { port ->
+                check(context.packageName == PACKAGE) { "Unexpected application package; update was not installed." }
+                check(WirelessAdbAccess.hasIdentity(context)) {
+                    "Pair this app in Wireless debugging before installing updates."
+                }
+                val connection = connect(port)
+                authenticated = true
+                val staging = AdbInstallStaging(UUID.randomUUID().toString().replace("-", ""))
+                var handedOff = false
+                try {
+                    // A detached lease also cleans partial uploads if cancellation closes the connection.
+                    execute(connection, staging.prepareCommand())
+                    apk.inputStream().use {
+                        push(connection, it, apk.length(), staging.apk, 0x180)
+                    }
+                    val script = staging.script().toByteArray(Charsets.UTF_8)
+                    push(connection, ByteArrayInputStream(script), script.size.toLong(), staging.scriptPath, 0x1c0)
+                    checkCancelled()
+                    beforeCommit()
+                    // From here any lost transport is an UNKNOWN outcome, never proof of success.
+                    handedOff = true
+                    execute(connection, staging.launchCommand())
+                    while (true) {
+                        checkCancelled()
+                        val outcome = AdbInstallOutcome.parse(execute(connection, staging.pollCommand()))
+                        if (outcome != null) {
+                            runCatching { execute(connection, staging.cleanupCommand()) }
+                            if (outcome.exitCode != 0) {
+                                if (outcome.exitCode == 124 || outcome.exitCode == 137 || outcome.exitCode == 143) {
+                                    throw IOException("Android installer stopped or timed out; its outcome is unknown. " +
+                                        outcome.output.take(8192))
+                                }
+                                throw WirelessAdbInstallRejectedException(
+                                    "Android rejected the update (exit ${outcome.exitCode}). ${outcome.output.take(8192)}",
+                                )
+                            }
+                            break
+                        }
+                        Thread.sleep(500)
+                    }
+                } finally {
+                    // Never remove a committed APK while the detached package manager still uses it.
+                    if (!handedOff && cancelled == null) {
+                        runCatching { execute(connection, staging.cleanupCommand()) }
+                    }
+                    relay?.close()
+                    runCatching { connection.close() }
+                }
+            }
+        } catch (error: Exception) {
+            if (!authenticated && error !is CancellationException && cancelled == null) {
+                throw WirelessAdbUnavailableException(error)
+            }
+            throw error
+        } finally {
+            deadline.cancel()
+        }
+    }
+
+    private fun connect(port: Int): AdbConnection {
         val identity = AdbIdentity.load(context)
         val connection = AdbConnection.Builder("127.0.0.1", port)
             .setApi(Build.VERSION.SDK_INT)
@@ -136,23 +249,39 @@ internal class WirelessAdbClient(private val context: Context) {
                 "ADB connection timed out. Check the main Wireless debugging port, not the pairing port."
             }
             checkCancelled()
-            execute(connection, "pm grant $PACKAGE android.permission.WRITE_SECURE_SETTINGS")
-            checkCancelled()
-            execute(connection, "appops set $PACKAGE WRITE_SETTINGS allow")
-            checkCancelled()
-            val status = WirelessGrantStatus.read(context)
-            check(status.complete) {
-                "ADB commands finished, but Android did not confirm both grants.\n${status.describe()}"
-            }
-            status
-        } finally {
-            // Close the relay first so upstream's connection-thread join cannot wait on network I/O.
+            return connection
+        } catch (error: Throwable) {
             relay?.close()
-            connection.close()
+            runCatching { connection.close() }
+            throw error
         }
     }
 
-    private fun execute(connection: AdbConnection, command: String) {
+    private fun push(connection: AdbConnection, input: InputStream, size: Long, path: String, mode: Int) {
+        connection.open("sync:").use { stream ->
+            // libadb 3.1.1 does not await READY between the chunks of an oversized write().
+            // Keep every call within the negotiated payload to preserve ADB flow control.
+            val limit = connection.maxData.also { require(it > 0) }
+            val output = object : OutputStream() {
+                override fun write(value: Int) = write(byteArrayOf(value.toByte()))
+                override fun write(bytes: ByteArray, offset: Int, length: Int) {
+                    var position = offset
+                    var remaining = length
+                    while (remaining > 0) {
+                        checkCancelled()
+                        val count = minOf(remaining, limit)
+                        stream.write(bytes, position, count)
+                        stream.flush()
+                        position += count
+                        remaining -= count
+                    }
+                }
+            }
+            AdbSyncTransfer.send(input, size, path, mode, stream.openInputStream(), output, ::checkCancelled)
+        }
+    }
+
+    private fun execute(connection: AdbConnection, command: String): String {
         checkCancelled()
         connection.open("shell:$command; result=\$?; printf '\\nICONGEN_EXIT=%s\\n' \"\$result\"").use { stream ->
             val output = StringBuilder()
@@ -172,13 +301,14 @@ internal class WirelessAdbClient(private val context: Context) {
                 // Do not await EOF: upstream can leave readers waiting after a peer's pending close.
                 if (EXIT_MARKER.containsMatchIn(output)) break
             }
-            val text = output.toString().trim()
-            val result = EXIT_MARKER.find(text + "\n")
+            val text = output.toString()
+            val result = EXIT_MARKER.find(text)
                 ?: throw IOException("ADB command ended without an exit status. ${text.take(1000)}")
+            val response = text.substring(0, result.range.first).trim()
             if (result.groupValues[1] != "0") {
-                throw IOException("ADB grant was rejected (exit ${result.groupValues[1]}). " +
-                    text.substring(0, result.range.first).trim().take(1000))
+                throw IOException("ADB command was rejected (exit ${result.groupValues[1]}). " + response.take(1000))
             }
+            return response
         }
     }
 
@@ -207,6 +337,159 @@ internal class WirelessAdbClient(private val context: Context) {
     companion object {
         private const val PACKAGE = "space.linuxct.nothing.icongen"
         private val EXIT_MARKER = Regex("(?:^|\\n)ICONGEN_EXIT=(\\d+)\\r?\\n")
+    }
+}
+
+/** Saved credentials are only a hint; every install must authenticate to the currently running adbd. */
+internal class WirelessAdbUnavailableException(cause: Exception) : IOException(
+    "Wireless ADB is unavailable or IconGen is no longer authorized. " +
+        "Enable Wireless debugging in Developer options and keep this phone on Wi-Fi. " +
+        "If its port changed, reopen Wireless ADB setup to discover the current port. " +
+        "If IconGen was forgotten or authorization was revoked, pair it again in Wireless ADB setup. " +
+        "No debugging setting or settings grant was changed. ${cause.message.orEmpty()}",
+    cause,
+)
+
+/** A completed installer response, distinct from an unknown outcome after a transport failure. */
+internal class WirelessAdbInstallRejectedException(message: String) : IOException(message)
+
+/** ADB sync v1 framing. Only exact, bounded responses can acknowledge a real streamed upload. */
+internal object AdbSyncTransfer {
+    const val MAX_FILE_SIZE = 512L * 1024 * 1024
+    private const val MAX_DATA = 64 * 1024
+    private const val MAX_FAILURE = 4096
+    private val STAGING_PATH = Regex("/data/local/tmp/icongen-update-[a-f0-9]{32}/(?:update\\.apk|install\\.sh)")
+
+    fun send(
+        source: InputStream,
+        size: Long,
+        path: String,
+        mode: Int,
+        response: InputStream,
+        destination: OutputStream,
+        checkCancelled: () -> Unit,
+    ) {
+        require(size in 1..MAX_FILE_SIZE) { "Invalid ADB upload size." }
+        require(STAGING_PATH.matches(path)) { "Invalid ADB staging path." }
+        require(mode == 0x180 || mode == 0x1c0) { "Invalid ADB staging permissions." }
+        val request = "$path,${0x8000 or mode}".toByteArray(Charsets.UTF_8)
+        require(request.size <= 1024) { "ADB staging path is too long." }
+        val header = ByteArray(8)
+        fun frame(id: String, value: Int) {
+            checkCancelled()
+            for (index in 0..3) {
+                header[index] = id[index].code.toByte()
+                header[index + 4] = (value ushr (8 * index)).toByte()
+            }
+            destination.write(header)
+        }
+        frame("SEND", request.size)
+        destination.write(request)
+        val buffer = ByteArray(MAX_DATA)
+        var remaining = size
+        while (remaining > 0) {
+            checkCancelled()
+            val count = source.read(buffer, 0, minOf(remaining, buffer.size.toLong()).toInt())
+            if (count < 0) throw EOFException("The verified APK was truncated during ADB upload.")
+            if (count == 0) throw IOException("ADB upload source made no progress.")
+            frame("DATA", count)
+            destination.write(buffer, 0, count)
+            remaining -= count
+        }
+        checkCancelled()
+        if (source.read() != -1) throw IOException("The verified APK changed size during ADB upload.")
+        frame("DONE", (System.currentTimeMillis() / 1000).toInt())
+        destination.flush()
+        readExactly(response, header, checkCancelled)
+        val id = String(header, 0, 4, Charsets.US_ASCII)
+        val length = (header[4].toInt() and 255) or
+            ((header[5].toInt() and 255) shl 8) or
+            ((header[6].toInt() and 255) shl 16) or
+            ((header[7].toInt() and 255) shl 24)
+        when (id) {
+            "OKAY" -> if (length != 0) throw IOException("Malformed ADB sync acknowledgement.")
+            "FAIL" -> {
+                if (length !in 0..MAX_FAILURE) throw IOException("Invalid ADB sync failure length.")
+                val message = ByteArray(length)
+                readExactly(response, message, checkCancelled)
+                throw IOException("ADB upload rejected: ${String(message, Charsets.UTF_8)}")
+            }
+            else -> throw IOException("Unexpected ADB sync response: $id")
+        }
+        checkCancelled()
+    }
+
+    private fun readExactly(input: InputStream, bytes: ByteArray, checkCancelled: () -> Unit) {
+        var offset = 0
+        while (offset < bytes.size) {
+            checkCancelled()
+            val count = input.read(bytes, offset, bytes.size - offset)
+            if (count < 0) throw EOFException("Truncated ADB sync response.")
+            if (count == 0) throw IOException("ADB sync response made no progress.")
+            offset += count
+        }
+    }
+}
+
+/** All remote names and shell arguments are generated here, never from release metadata. */
+internal class AdbInstallStaging(token: String) {
+    init {
+        require(TOKEN.matches(token)) { "Invalid ADB install identifier." }
+    }
+
+    private val directory = "/data/local/tmp/icongen-update-$token"
+    val apk = "$directory/update.apk"
+    val scriptPath = "$directory/install.sh"
+    private val log = "$directory/output"
+    private val status = "$directory/result"
+
+    fun prepareCommand(): String =
+        "if [ ! -x /system/bin/nohup ] || [ ! -x /system/bin/setsid ] || " +
+            "[ ! -x /system/bin/timeout ]; then " +
+            "printf 'This Android build lacks the detached installer tools (nohup, setsid, timeout).\\n'; false; " +
+            "else umask 077 && mkdir -m 700 $directory && " +
+            "{ /system/bin/nohup /system/bin/setsid /system/bin/sh -c " +
+            "'sleep 600; rm -rf $directory' </dev/null >/dev/null 2>&1 & }; fi"
+
+    fun script(): String = """
+        #!/system/bin/sh
+        umask 077
+        /system/bin/timeout 120 /system/bin/pm install -r --bypass-low-target-sdk-block $apk
+        result=${'$'}?
+        rm -f $apk $scriptPath
+        printf 'ICONGEN_PM_EXIT=%s\n' "${'$'}result" >$status.tmp
+        mv $status.tmp $status
+        exit "${'$'}result"
+    """.trimIndent() + "\n"
+
+    fun launchCommand(): String =
+        "{ /system/bin/nohup /system/bin/setsid /system/bin/sh $scriptPath " +
+            "</dev/null >$log 2>&1 & }"
+
+    fun pollCommand(): String =
+        "if [ -f $status ]; then cat $status; dd if=$log bs=8192 count=1 2>/dev/null; " +
+            "else printf 'ICONGEN_PM_WAIT\\n'; fi"
+
+    fun cleanupCommand(): String = "rm -rf $directory"
+
+    companion object {
+        private val TOKEN = Regex("[a-f0-9]{32}")
+    }
+}
+
+internal data class AdbInstallOutcome(val exitCode: Int, val output: String) {
+    companion object {
+        private val RESULT = Regex("ICONGEN_PM_EXIT=([0-9]{1,3})")
+
+        fun parse(response: String): AdbInstallOutcome? {
+            if (response == "ICONGEN_PM_WAIT") return null
+            val first = response.substringBefore('\n').removeSuffix("\r")
+            val code = RESULT.matchEntire(first)
+                ?.groupValues?.get(1)?.toIntOrNull()
+                ?.takeIf { it in 0..255 }
+                ?: throw IOException("Malformed detached Android installer result.")
+            return AdbInstallOutcome(code, response.substringAfter('\n', "").trim())
+        }
     }
 }
 

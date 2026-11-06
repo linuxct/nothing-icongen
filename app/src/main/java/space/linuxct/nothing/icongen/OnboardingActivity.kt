@@ -113,13 +113,13 @@ class OnboardingActivity : AppCompatActivity() {
         ui.toggle(choices, "Theme changes", "Refresh selected icons when light or dark mode changes; no rebuild needed.", draft.themeChanges) {
             save { current -> current.copy(themeChanges = it) }
         }
-        ui.toggle(choices, "IconGen updates", "Check GitHub for newer stable releases about once a day. Enable notifications for update alerts; manual checks are also available in the menu.", draft.appReleaseUpdates) {
+        ui.toggle(choices, "IconGen updates", "Check GitHub for newer stable releases about once a day. Notifications can open an available update. Installation requires you to choose Update now and needs paired Wireless debugging.", draft.appReleaseUpdates) {
             save { current -> current.copy(appReleaseUpdates = it) }
         }
         ui.toggle(choices, "Notifications", "Optional build progress and results. Not required for app-update detection.", draft.notifications, last = true) {
             save { current -> current.copy(notifications = it) }
         }
-        ui.add(root, ui.text("Only Theme changes keeps a background theme-monitor service running, with Android’s required silent notification. With it off, that service and its notification stop. App updates work independently. Wireless setup uses a separate temporary pairing notification.", 13f, muted = true), 16)
+        ui.add(root, ui.text("Only Theme changes keeps a background theme-monitor service running, with Android’s required silent notification. With it off, that service and its notification stop. App updates work independently. Wireless pairing and IconGen installation use separate temporary service notifications. Settings grants alone do not authorize IconGen installation; Wireless debugging may be off when you are not using the updater.", 13f, muted = true), 16)
         ui.add(root, ui.button("Continue", primary = true, action = ::next), 20)
     }
 

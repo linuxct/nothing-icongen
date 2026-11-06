@@ -3,6 +3,7 @@ package space.linuxct.nothing.icongen
 import android.Manifest
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -30,6 +31,15 @@ class MainActivity : AppCompatActivity() {
     private var updateConsentDialog: android.app.Dialog? = null
     private var manualUpdateDialog: android.app.Dialog? = null
     private var manualUpdateInFlight = false
+    private var selfUpdateDialog: android.app.Dialog? = null
+    private var selfUpdateContent: LinearLayout? = null
+    private var restoreSelfUpdateDialog = false
+    private val selfUpdatePrefs by lazy { getSharedPreferences(AppSelfUpdater.PREFS, MODE_PRIVATE) }
+    private val selfUpdateListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+        runOnUiThread {
+            if (activityResumed && !isFinishing && !isDestroyed) renderSelfUpdateStatus()
+        }
+    }
     private var builtApk: File? = null
     private var activityResumed = false
     private var resumingInstall = false
@@ -39,6 +49,7 @@ class MainActivity : AppCompatActivity() {
         private const val TAG = "MainActivity"
         private const val KEY_NOTIFICATION_ASKED = "notification_asked"
         const val EXTRA_THEME_ACCESS = "show_theme_access"
+        const val EXTRA_CHECK_ICONGEN_UPDATES = "check_icongen_updates"
         private const val KEY_SOURCE_ASKED = "source_asked"
         private const val KEY_FLOW_ACTIVE = "flow_active"
         private const val KEY_AWAITING = "awaiting"
@@ -88,6 +99,7 @@ class MainActivity : AppCompatActivity() {
         }
         ui = LucentUi(this)
         createHome()
+        restoreSelfUpdateDialog = savedInstanceState?.getBoolean("self_update_dialog", false) == true
         // With the legacy target Android owns the notification prompt. Only prepare
         // optional channels here when the user actually chose those notifications.
         if (NotificationPreferences.isEnabled(this)) IconPackBuildService.ensureChannels(this)
@@ -130,10 +142,12 @@ class MainActivity : AppCompatActivity() {
             ThemeRefreshController.setEnabled(this, enabled)
             refreshThemeAccess()
         }
-        ui.toggle(automationCard, "IconGen updates", "Check GitHub for stable releases about once a day; Check for updates is also in the menu", AppUpdateChecker.isEnabled(this), last = true) { enabled ->
+        ui.toggle(automationCard, "IconGen updates", "Check GitHub for stable releases about once a day; available updates are in the menu", AppUpdateChecker.isEnabled(this), last = true) { enabled ->
             AppUpdateChecker.setEnabled(this, enabled)
+            renderAutomation()
         }
     }
+
 
     private fun postUpdateConsent() {
         window.decorView.post {
@@ -141,12 +155,13 @@ class MainActivity : AppCompatActivity() {
                 !OnboardingState.isComplete(this) || AppUpdateChecker.hasDecision(this) ||
                 !window.decorView.hasWindowFocus() || updateConsentDialog?.isShowing == true ||
                 setupDialog?.isShowing == true || manualUpdateDialog?.isShowing == true ||
+                selfUpdateDialog?.isShowing == true ||
                 setupPrefs.getBoolean(KEY_FLOW_ACTIVE, false) ||
                 setupPrefs.contains(KEY_AWAITING) || intent.getBooleanExtra(EXTRA_THEME_ACCESS, false)
             ) return@post
             updateConsentDialog = ui.dialog(this, "IconGen updates") { content, dialog ->
-                ui.add(content, ui.text("Allow IconGen to contact GitHub in the background about once every 24 hours to check for new stable IconGen releases? Android may delay these checks. Background checks stay off unless you enable this option; Check for updates in the menu always works manually.", 14f))
-                ui.add(content, ui.text("When optional notifications are enabled and allowed by Android, a newer stable release can show an alert linking to GitHub. Updates are never installed automatically. Install using a PC with the ADB bypass, or on your phone with InstallerX Revived and Shizuku. You can change background checks in Automation.", 13f, muted = true), 12)
+                ui.add(content, ui.text("Allow IconGen to contact GitHub in the background about once every 24 hours to check for new stable IconGen releases? Android may delay these checks. Background checks stay off unless you enable this option. Available releases can also be opened from the menu.", 14f))
+                ui.add(content, ui.text("Optional notifications can open an available update in IconGen. Updates download and install through this phone’s paired Wireless debugging connection only after you choose Update now.", 13f, muted = true), 12)
                 ui.add(content, ui.button("Enable", primary = true) {
                     AppUpdateChecker.setEnabled(this, true)
                     dialog.dismiss()
@@ -161,8 +176,8 @@ class MainActivity : AppCompatActivity() {
                     if (!AppUpdateChecker.hasDecision(this@MainActivity)) {
                         AppUpdateChecker.setEnabled(this@MainActivity, false)
                     }
-                    updateConsentDialog = null
-                    if (!isFinishing && !isDestroyed) renderAutomation()
+                    if (updateConsentDialog === this) updateConsentDialog = null
+                    if (activityResumed && !isFinishing && !isDestroyed) renderAutomation()
                 }
             }
         }
@@ -211,9 +226,16 @@ class MainActivity : AppCompatActivity() {
                 ui.add(content, ui.row("Reinstall icon pack", "Install the last generated pack") { dialog.dismiss(); requestOperation(ACTION_INSTALL) })
             }
             ui.add(content, ui.row("Build details", "Status and diagnostic information") { dialog.dismiss(); showBuildDetails() })
-            ui.add(content, ui.row("Check for updates", "Check GitHub’s latest stable IconGen release") { dialog.dismiss(); checkForUpdates() })
+            ui.add(content, ui.row("IconGen update status", "Check for updates or view installation progress") {
+                dialog.dismiss()
+                openIconGenUpdateStatus()
+            })
             ui.add(content, ui.button("Done") { dialog.dismiss() }, 12)
         }
+    }
+
+    private fun openIconGenUpdateStatus() {
+        if (AppSelfUpdater.isRunning(this)) showSelfUpdateStatus() else checkForUpdates()
     }
 
     private fun checkForUpdates() {
@@ -233,7 +255,7 @@ class MainActivity : AppCompatActivity() {
                 accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
             })
             ui.add(resultContent, ui.text("Background checks and notification settings will not change.", 13f, muted = true), 12)
-            ui.add(resultContent, ui.button("Cancel") { dismissManualUpdateDialog() }, 20)
+            ui.add(resultContent, ui.button("Done") { dismissManualUpdateDialog() }, 20)
         }
         manualUpdateDialog = dialog
         // Invalidate immediately on Back/outside taps, before the dialog's exit animation.
@@ -245,6 +267,10 @@ class MainActivity : AppCompatActivity() {
         }
         AppUpdateChecker.checkNow(this) { result ->
             manualUpdateInFlight = false
+            if (activityResumed && intent.getBooleanExtra(EXTRA_CHECK_ICONGEN_UPDATES, false)) {
+                handleUpdateCheckIntent()
+                return@checkNow
+            }
             if (!activityResumed || isFinishing || isDestroyed ||
                 manualUpdateDialog !== dialog || !dialog.isShowing
             ) return@checkNow
@@ -257,16 +283,24 @@ class MainActivity : AppCompatActivity() {
                     ui.add(resultContent, ui.text("Update available", 18f))
                     ui.add(resultContent, ui.text("Installed: $installedVersion\nLatest stable: ${release.version}", 14f), 12)
                     ui.add(resultContent, ui.text(release.title, 14f), 12)
-                    ui.add(resultContent, ui.text("View the release and installation instructions on GitHub. Install using a PC with the ADB bypass, or on your phone with InstallerX Revived and Shizuku. Nothing is installed automatically.", 13f, muted = true), 12)
-                    ui.add(resultContent, ui.button("View update", primary = true) {
+                    ui.add(resultContent, ui.text("Update now downloads and verifies the official APK, then installs it using this phone’s paired Wireless debugging identity. Android will restart IconGen. Keep Wi-Fi and Wireless debugging on until installation finishes. No PC is needed after pairing; Settings grants alone do not authorize installation.", 13f, muted = true), 12)
+                    ui.add(resultContent, ui.text(wirelessUpdateGuidance(), 13f, muted = true), 12)
+                    ui.add(resultContent, ui.button("Update now", primary = true) {
+                        val accepted = AppSelfUpdater.start(this, release)
+                        dismissManualUpdateDialog()
+                        showSelfUpdateStatus()
+                        if (!accepted) {
+                            Toast.makeText(this, "Update could not start. Check the status and Wireless debugging setup.", Toast.LENGTH_LONG).show()
+                        }
+                    }, 20)
+                    ui.add(resultContent, ui.button("View release") {
                         try {
                             startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(release.url)))
                             dismissManualUpdateDialog()
                         } catch (_: ActivityNotFoundException) {
                             Toast.makeText(this, "No app can open the release page.", Toast.LENGTH_LONG).show()
                         }
-                    }, 20)
-                    ui.add(resultContent, ui.button("Not now") { dismissManualUpdateDialog() }, 8)
+                    }, 8)
                 }
                 is AppUpdateChecker.CheckResult.Current -> {
                     ui.add(resultContent, ui.text("You’re up to date", 18f))
@@ -281,9 +315,8 @@ class MainActivity : AppCompatActivity() {
                     ui.add(resultContent, ui.text("Your update status could not be determined. Try again later.\n\n${result.reason}", 14f), 12)
                 }
             }
-            if (result !is AppUpdateChecker.CheckResult.Available) {
-                ui.add(resultContent, ui.button("Done") { dismissManualUpdateDialog() }, 20)
-            }
+            ui.add(resultContent, ui.button("Done") { dismissManualUpdateDialog() },
+                if (result is AppUpdateChecker.CheckResult.Available) 8 else 20)
         }
     }
 
@@ -291,6 +324,110 @@ class MainActivity : AppCompatActivity() {
         val dialog = manualUpdateDialog
         manualUpdateDialog = null
         dialog?.dismiss()
+    }
+
+    private fun wirelessUpdateGuidance(): String = if (WirelessAdbAccess.hasIdentity(this)) {
+        "A Wireless debugging identity is saved, but its pairing and connection are not yet verified. Enable Wireless debugging on trusted Wi-Fi. If Android forgot IconGen, pair again."
+    } else {
+        "Pair this IconGen installation with this phone first, even if a PC already granted Settings access. Then return here and retry the update."
+    }
+
+    private fun openUpdaterWirelessSetup() {
+        startActivity(Intent(this, WirelessDebuggingActivity::class.java)
+            .putExtra(WirelessDebuggingActivity.EXTRA_FOR_APP_UPDATE, true))
+    }
+
+    private fun showSelfUpdateStatus() {
+        if (!activityResumed || isFinishing || isDestroyed) return
+        if (selfUpdateDialog?.isShowing == true) {
+            renderSelfUpdateStatus()
+            return
+        }
+        selfUpdateDialog = ui.dialog(this, "IconGen update") { content, _ ->
+            selfUpdateContent = ui.column()
+            ui.add(content, selfUpdateContent!!)
+        }.apply {
+            setOnCancelListener {
+                if (selfUpdateDialog === this) {
+                    selfUpdateDialog = null
+                    selfUpdateContent = null
+                }
+                restoreSelfUpdateDialog = false
+            }
+            setOnDismissListener {
+                if (selfUpdateDialog === this) {
+                    selfUpdateDialog = null
+                    selfUpdateContent = null
+                }
+            }
+        }
+        renderSelfUpdateStatus()
+    }
+
+    private fun renderSelfUpdateStatus() {
+        val content = selfUpdateContent ?: return
+        if (selfUpdateDialog?.isShowing != true || !activityResumed) return
+        val status = AppSelfUpdater.status(this)
+        val running = AppSelfUpdater.isRunning(this)
+        content.removeAllViews()
+        ui.add(content, ui.text(status.phase.name.lowercase().replaceFirstChar { it.uppercase() }, 18f))
+        status.version?.let { ui.add(content, ui.text("Version: $it", 14f), 12) }
+        ui.add(content, ui.text(status.message, 14f).apply {
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }, 12)
+        if (running) {
+            ui.add(content, ProgressBar(this).apply {
+                isIndeterminate = true
+                indeterminateTintList = android.content.res.ColorStateList.valueOf(ui.ink)
+            }, 16)
+        }
+        val preinstall = status.phase == AppSelfUpdater.Phase.DISCOVERING ||
+            status.phase == AppSelfUpdater.Phase.DOWNLOADING || status.phase == AppSelfUpdater.Phase.VERIFYING
+        if (status.phase == AppSelfUpdater.Phase.INSTALLING) {
+            ui.add(content, ui.text("Android may close IconGen to replace it. This is not confirmation of success: reopen IconGen to verify the installed version. Installation can no longer be cancelled.", 13f, muted = true), 12)
+        } else if (!running) {
+            val needsWirelessSetup = status.phase == AppSelfUpdater.Phase.FAILED && status.needsWirelessSetup
+            if (needsWirelessSetup) {
+                ui.add(content, ui.text(wirelessUpdateGuidance(), 13f, muted = true), 12)
+            }
+            val available = AppUpdateChecker.availableRelease(this)
+            if (available != null) {
+                ui.add(content, ui.button(if (status.phase == AppSelfUpdater.Phase.FAILED) "Retry update" else "Update now", primary = true) {
+                    AppSelfUpdater.start(this, available)
+                }, 16)
+            }
+            if (needsWirelessSetup) {
+                ui.add(content, ui.button("Pair or reconnect Wireless debugging") {
+                    dismissSelfUpdateDialog()
+                    openUpdaterWirelessSetup()
+                }, 16)
+            }
+        }
+        if (running && preinstall) {
+            ui.add(content, ui.button("Cancel update") { AppSelfUpdater.cancel(this) }, 16)
+        }
+        ui.add(content, ui.button(if (running) "Close · continue in background" else "Done") {
+            dismissSelfUpdateDialog()
+        }, 8)
+    }
+
+    private fun dismissSelfUpdateDialog() {
+        val dialog = selfUpdateDialog
+        selfUpdateDialog = null
+        selfUpdateContent = null
+        restoreSelfUpdateDialog = false
+        dialog?.dismiss()
+    }
+
+    private fun handleUpdateCheckIntent() {
+        if (!activityResumed || !intent.getBooleanExtra(EXTRA_CHECK_ICONGEN_UPDATES, false) ||
+            manualUpdateInFlight
+        ) return
+        intent.removeExtra(EXTRA_CHECK_ICONGEN_UPDATES)
+        updateConsentDialog?.dismiss()
+        dismissSelfUpdateDialog()
+        dismissManualUpdateDialog()
+        openIconGenUpdateStatus()
     }
 
     private fun showBuildDetails() {
@@ -320,12 +457,16 @@ class MainActivity : AppCompatActivity() {
                 dialog.dismiss(); showSettingsAccessInstructions()
             })
             ui.divider(content)
+            ui.add(content, ui.row("Wireless debugging for IconGen updates", "Pair or reconnect · Settings grants alone cannot install IconGen") {
+                dialog.dismiss(); openUpdaterWirelessSetup()
+            })
+            ui.divider(content)
             ui.add(content, ui.row("Background icon refresh", if (LauncherRefreshAccess.isGranted(this)) "Allowed · no overlay is drawn" else "Prepare updated icons without interrupting your app") {
                 dialog.dismiss(); showBackgroundRefreshAccess()
             })
             ui.divider(content)
             ui.add(content, ui.row("Notification access", if (notificationsAvailable()) "Allowed" else "Blocked · tap to manage") { dialog.dismiss(); requestNotificationAccess() })
-            ui.add(content, ui.text("Only enabled Theme changes requires a running theme-monitor service and Android’s silent monitoring notification. App updates work independently. Wireless setup uses a separate temporary pairing notification.", 12f, muted = true), 16)
+            ui.add(content, ui.text("Only enabled Theme changes keeps a theme-monitor service running. App updates work independently. Wireless pairing and IconGen installation each use their own temporary service notification; neither keeps an idle ADB service running.", 12f, muted = true), 16)
             ui.add(content, ui.row("Run setup again", "Review your feature choices and guided access setup") {
                 dialog.dismiss()
                 startActivity(Intent(this, OnboardingActivity::class.java)
@@ -594,12 +735,14 @@ class MainActivity : AppCompatActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        if (::ui.isInitialized) handleUpdateCheckIntent()
     }
 
     override fun onResume() {
         super.onResume()
         if (!::ui.isInitialized) return
         activityResumed = true
+        selfUpdatePrefs.registerOnSharedPreferenceChangeListener(selfUpdateListener)
         renderAutomation()
         IconPackInstaller.restoreState(this)
         // Re-attach: the build may have started while this Activity did not exist.
@@ -608,11 +751,23 @@ class MainActivity : AppCompatActivity() {
         advancePermissionSetup()
         BackgroundMonitorService.sync(this)
         AppUpdateChecker.sync(this)
+        AppSelfUpdater.recover(this)
+        if (intent.getBooleanExtra(EXTRA_CHECK_ICONGEN_UPDATES, false)) {
+            handleUpdateCheckIntent()
+        } else if (restoreSelfUpdateDialog || AppSelfUpdater.isRunning(this)) {
+            restoreSelfUpdateDialog = false
+            showSelfUpdateStatus()
+        }
         if (intent.getBooleanExtra(EXTRA_THEME_ACCESS, false)) {
             intent.removeExtra(EXTRA_THEME_ACCESS)
             showSettingsAccessInstructions()
         }
         postUpdateConsent()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("self_update_dialog", selfUpdateDialog?.isShowing == true || restoreSelfUpdateDialog)
+        super.onSaveInstanceState(outState)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -622,6 +777,10 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         activityResumed = false
+        selfUpdatePrefs.unregisterOnSharedPreferenceChangeListener(selfUpdateListener)
+        val restoreStatus = selfUpdateDialog?.isShowing == true
+        dismissSelfUpdateDialog()
+        restoreSelfUpdateDialog = restoreStatus
         dismissManualUpdateDialog()
         BuildCoordinator.removeListener(buildListener)
         super.onPause()
@@ -629,6 +788,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         dismissManualUpdateDialog()
+        dismissSelfUpdateDialog()
         IconPackInstaller.statusListener = null
         super.onDestroy()
     }

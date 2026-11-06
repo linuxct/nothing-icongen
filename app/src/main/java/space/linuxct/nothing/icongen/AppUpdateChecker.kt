@@ -13,7 +13,6 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -25,7 +24,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** Optional stable-release checks. Installation always remains an explicit user action. */
+/** Optional stable-release checks; installation always requires an explicit in-app update action. */
 object AppUpdateChecker {
     private const val TAG = "AppUpdateChecker"
     const val CHANNEL_ID = "icongen_releases"
@@ -54,10 +53,12 @@ object AppUpdateChecker {
 
     fun hasDecision(context: Context): Boolean = prefs(context).contains(DECISION_KEY)
 
-    fun setEnabled(context: Context, enabled: Boolean) = synchronized(NotificationPreferences) {
-        prefs(context).edit().putBoolean(PREFS_KEY, enabled).putBoolean(DECISION_KEY, true).apply()
-        if (!enabled) generation++
-        sync(context)
+    fun setEnabled(context: Context, enabled: Boolean) {
+        synchronized(NotificationPreferences) {
+            prefs(context).edit().putBoolean(PREFS_KEY, enabled).putBoolean(DECISION_KEY, true).apply()
+            if (!enabled) generation++
+            sync(context)
+        }
     }
 
     /** KEEP existing schedules: repeatedly opening the app must not postpone either job. */
@@ -110,12 +111,20 @@ object AppUpdateChecker {
         context.getSystemService(NotificationManager::class.java).cancel(PERIODIC_JOB_ID)
     }
 
+    data class ReleaseAsset(
+        val name: String,
+        val url: String,
+        val size: Long,
+        val sha256: String?,
+    )
+
     data class ReleaseInfo(
         val tagName: String,
         val title: String,
         val url: String,
         val releasedAt: String,
-        val version: String
+        val version: String,
+        val apk: ReleaseAsset,
     )
 
     sealed interface CheckResult {
@@ -134,20 +143,32 @@ object AppUpdateChecker {
         }
     }
 
+    /** Retain a detected release across pairing, Activity recreation and interrupted downloads. */
+    internal fun availableRelease(context: Context): ReleaseInfo? {
+        val cache = context.getSharedPreferences("app_available_update", Context.MODE_PRIVATE)
+        val json = cache.getString("release", null) ?: return null
+        val available = runCatching {
+            val installed = context.packageManager.getPackageInfo(context.packageName, 0).versionName.orEmpty()
+            (evaluateRelease(json, installed) as? CheckResult.Available)?.release
+        }.getOrNull()
+        if (available == null) cache.edit().remove("release").apply()
+        return available
+    }
+
     private fun fetchAndCompare(context: Context): CheckResult = try {
         val installed = context.packageManager.getPackageInfo(context.packageName, 0).versionName
             ?: error("The installed app has no version name")
         if (UpdateVersion.parse(installed) == null) {
             CheckResult.Failed("The installed version could not be read: $installed")
         } else {
-            fetchLatestRelease(installed)
+            fetchLatestRelease(context, installed)
         }
     } catch (e: Exception) {
         Log.w(TAG, "Update check failed", e)
         CheckResult.Failed(e.message ?: "Could not check GitHub for updates")
     }
 
-    private fun fetchLatestRelease(installed: String): CheckResult {
+    private fun fetchLatestRelease(context: Context, installed: String): CheckResult {
         val connection = URL(LATEST_URL).openConnection() as HttpURLConnection
         try {
             connection.requestMethod = "GET"
@@ -157,9 +178,20 @@ object AppUpdateChecker {
             connection.setRequestProperty("Accept", "application/vnd.github+json")
             return when (val status = connection.responseCode) {
                 HttpURLConnection.HTTP_OK -> connection.inputStream.bufferedReader().use {
-                    evaluateRelease(it.readText(), installed)
+                    val json = it.readText()
+                    val result = evaluateRelease(json, installed)
+                    if (result !is CheckResult.Failed) {
+                        val cache = context.getSharedPreferences("app_available_update", Context.MODE_PRIVATE).edit()
+                        if (result is CheckResult.Available) cache.putString("release", json)
+                        else cache.remove("release")
+                        cache.apply()
+                    }
+                    result
                 }
-                HttpURLConnection.HTTP_NOT_FOUND -> CheckResult.NoStableRelease
+                HttpURLConnection.HTTP_NOT_FOUND -> {
+                    context.getSharedPreferences("app_available_update", Context.MODE_PRIVATE).edit().remove("release").apply()
+                    CheckResult.NoStableRelease
+                }
                 else -> CheckResult.Failed("GitHub returned HTTP $status. Please try again later.")
             }
         } finally {
@@ -174,16 +206,20 @@ object AppUpdateChecker {
         val tag = root.getString("tag_name")
         val version = UpdateVersion.fromTag(tag) ?: return null
         val assets = root.getJSONArray("assets")
-        val hasApk = (0 until assets.length()).any { index ->
-            val asset = assets.getJSONObject(index)
-            asset.optString("name").endsWith(".apk", ignoreCase = true) &&
-                asset.optString("browser_download_url").startsWith(DOWNLOAD_URL_PREFIX)
-        }
-        if (!hasApk) return null
+        val asset = (0 until assets.length()).asSequence().map { assets.getJSONObject(it) }.firstOrNull {
+            it.optString("name") == "IconGen.apk" &&
+                it.optString("browser_download_url").startsWith(DOWNLOAD_URL_PREFIX)
+        } ?: return null
+        val size = asset.getLong("size")
+        require(size > 0) { "GitHub returned an invalid APK size" }
+        val digest = if (asset.isNull("digest")) null else asset.getString("digest").also {
+            require(it.matches(Regex("sha256:[0-9a-fA-F]{64}"))) { "GitHub returned an invalid APK digest" }
+        }.substringAfter(':').lowercase()
+        val apk = ReleaseAsset(asset.getString("name"), asset.getString("browser_download_url"), size, digest)
         val url = root.getString("html_url")
         require(url.startsWith(RELEASE_URL_PREFIX)) { "GitHub returned an invalid release link" }
         return ReleaseInfo(tag, root.optString("name").ifBlank { tag }, url,
-            root.getString("published_at"), version.text)
+            root.getString("published_at"), version.text, apk)
     }
 
     internal fun evaluateRelease(json: String, installedVersion: String): CheckResult = try {
@@ -257,7 +293,9 @@ object AppUpdateChecker {
         ) return false
         return try {
             val intent = PendingIntent.getActivity(context, PERIODIC_JOB_ID,
-                Intent(Intent.ACTION_VIEW, Uri.parse(release.url)),
+                Intent(context, MainActivity::class.java)
+                    .putExtra(MainActivity.EXTRA_CHECK_ICONGEN_UPDATES, true)
+                    .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
             val notification = Notification.Builder(context, CHANNEL_ID)
                 .setContentTitle("IconGen update available")

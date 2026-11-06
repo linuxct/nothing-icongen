@@ -33,6 +33,7 @@ class App : Application() {
         // A manifest install callback must run before disappearance-of-session recovery;
         // it can authoritatively confirm a same-version reinstall.
         Handler(Looper.getMainLooper()).post {
+            AppSelfUpdater.recover(this)
             IconPackInstaller.restoreState(this)
             IconPackSelectionJobService.schedule(this)
             AppUpdateChecker.sync(this)

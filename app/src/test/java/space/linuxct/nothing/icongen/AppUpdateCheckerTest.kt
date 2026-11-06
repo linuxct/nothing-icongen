@@ -7,6 +7,7 @@ import android.app.job.JobInfo
 import android.app.job.JobParameters
 import android.app.job.JobScheduler
 import android.content.Context
+import android.content.pm.PackageInfo
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.After
@@ -35,6 +36,7 @@ class AppUpdateCheckerTest {
         AppUpdateChecker.setEnabled(context, false)
         prefs.edit().clear().commit()
         context.getSharedPreferences("notification_preferences", Context.MODE_PRIVATE).edit().clear().commit()
+        context.getSharedPreferences("app_available_update", Context.MODE_PRIVATE).edit().clear().commit()
         scheduler.cancelAll()
         notifications.cancelAll()
         notifications.deleteNotificationChannel(AppUpdateChecker.CHANNEL_ID)
@@ -62,6 +64,8 @@ class AppUpdateCheckerTest {
         .put("prerelease", false)
         .put("assets", JSONArray().put(JSONObject()
             .put("name", "IconGen.apk")
+            .put("size", 1234L)
+            .put("digest", "sha256:" + "a".repeat(64))
             .put("browser_download_url", "https://github.com/linuxct/nothing-icongen/releases/download/$tag/IconGen.apk")
             .put("uploader", JSONObject().put("html_url", "https://github.com/uploader"))))
         .put("author", JSONObject().put("name", "Not the release title")
@@ -69,6 +73,40 @@ class AppUpdateCheckerTest {
 
     private fun available(tag: String = "build-1.0.0.9-9.1793917972") =
         AppUpdateChecker.CheckResult.Available(AppUpdateChecker.parseRelease(release(tag).toString())!!)
+
+
+    @Test fun detectedReleaseRemainsAvailableUntilItsVersionIsInstalled() {
+        fun install(version: String) {
+            shadowOf(context.packageManager).installPackage(PackageInfo().apply {
+                packageName = context.packageName
+                versionName = version
+                versionCode = 9
+            })
+        }
+        install("1.0.0.1")
+        context.getSharedPreferences("app_available_update", Context.MODE_PRIVATE).edit()
+            .putString("release", release().toString()).commit()
+        assertEquals("1.0.0.9", AppUpdateChecker.availableRelease(context)?.version)
+        install("1.0.0.10")
+        assertNull(AppUpdateChecker.availableRelease(context))
+        install("1.0.0.1")
+        assertNull(AppUpdateChecker.availableRelease(context))
+    }
+
+    @Test fun backgroundDetectionNeverStartsInstallationEvenWithAnOldAutomaticInstallPreference() {
+        shadowOf(context.packageManager).installPackage(PackageInfo().apply {
+            packageName = context.packageName
+            versionName = "1.0.0.1"
+            versionCode = 1
+        })
+        context.getSharedPreferences(AppSelfUpdater.PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean("automatic_install_enabled", true).commit()
+        enable()
+        AppUpdateChecker.checkAutomatically(context, now, fetch = { available() })
+        assertEquals(AppSelfUpdater.Phase.IDLE, AppSelfUpdater.status(context).phase)
+        assertFalse(AppSelfUpdater.isRunning(context))
+        assertEquals(1, notifications.activeNotifications.size)
+    }
 
     @Test fun parserKeepsRootMetadataAndUnescapesStrings() {
         val parsed = AppUpdateChecker.parseRelease(release().toString())!!
@@ -86,6 +124,17 @@ class AppUpdateCheckerTest {
         assertNull(AppUpdateChecker.parseRelease(release("build-not-a-version-9.1793917972").toString()))
         assertNull(AppUpdateChecker.parseRelease(release("1.0.00.9").toString()))
         assertTrue(AppUpdateChecker.evaluateRelease("not JSON", "1.0.0.1") is AppUpdateChecker.CheckResult.Failed)
+    }
+
+    @Test fun invalidArtifactMetadataCannotBecomeAnInstallableUpdate() {
+        val invalidSize = release().apply { getJSONArray("assets").getJSONObject(0).put("size", -1) }
+        assertTrue(AppUpdateChecker.evaluateRelease(invalidSize.toString(), "1.0.0.8") is AppUpdateChecker.CheckResult.Failed)
+        val invalidDigest = release().apply { getJSONArray("assets").getJSONObject(0).put("digest", "sha256:truncated") }
+        assertTrue(AppUpdateChecker.evaluateRelease(invalidDigest.toString(), "1.0.0.8") is AppUpdateChecker.CheckResult.Failed)
+        val wrongRepository = release().apply {
+            getJSONArray("assets").getJSONObject(0).put("browser_download_url", "https://github.com/another/app/releases/download/v9/IconGen.apk")
+        }
+        assertNull(AppUpdateChecker.parseRelease(wrongRepository.toString()))
     }
 
     @Test fun fourPartVersionsUseNumericComponentsNotLexicalOrderOrMachineIntegerRange() {
@@ -148,7 +197,6 @@ class AppUpdateCheckerTest {
         AppUpdateChecker.checkAutomatically(context, now + 1, fetch = { available() })
         val posted = notifications.activeNotifications.single().notification
         assertTrue(posted.contentIntent.isImmutable)
-        assertEquals(available().release.url, shadowOf(posted.contentIntent).savedIntent.data.toString())
         assertEquals("1.0.0.9", prefs.getString("app_update_notified_version", null))
         assertFalse(AppUpdateChecker.isDue(context, now + 2))
     }

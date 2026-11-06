@@ -30,14 +30,16 @@ class WirelessSetupService : Service() {
         private const val ACTION_REFRESH = "space.linuxct.nothing.icongen.wireless.REFRESH"
         private const val ACTION_STOP = "space.linuxct.nothing.icongen.wireless.STOP"
         private const val CODE_RESULT = "pairing_code"
+        private const val EXTRA_PAIR_ONLY = "pair_only"
         private const val OPERATION_TIMEOUT_MS = 45_000L
         private const val SESSION_TIMEOUT_MS = 180_000L
         private const val INITIAL_STATUS = "Start setup, then open Wireless debugging in Android Settings."
         @Volatile private var active = false
 
-        fun start(context: Context): Boolean {
+        fun start(context: Context, pairOnly: Boolean = false): Boolean {
             val app = context.applicationContext
             val intent = Intent(app, WirelessSetupService::class.java).setAction(ACTION_START)
+                .putExtra(EXTRA_PAIR_ONLY, pairOnly)
             try {
                 app.startForegroundService(intent)
                 return true
@@ -54,18 +56,26 @@ class WirelessSetupService : Service() {
             context.applicationContext.stopService(Intent(context, WirelessSetupService::class.java))
         }
 
-        fun status(context: Context): String {
+        fun status(context: Context, forAppUpdate: Boolean = false): String {
             val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            return if (!active && prefs.getBoolean(KEY_RUNNING, false)) {
+            val message = if (!active && prefs.getBoolean(KEY_RUNNING, false)) {
                 "The previous setup ended. Start setup again and use a fresh pairing-code dialog."
             } else prefs.getString(KEY_STATUS, INITIAL_STATUS) ?: INITIAL_STATUS
+            if (forAppUpdate && !active) {
+                return if (prefs.getBoolean(EXTRA_PAIR_ONLY, false)) {
+                    "Last update setup: $message\nEvery update requires a fresh authenticated connection."
+                } else {
+                    "Enable Wireless debugging or pair IconGen again for updates. Previous Settings setup does not verify an update connection."
+                }
+            }
+            return message
         }
 
         fun isRunning(context: Context): Boolean = active &&
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_RUNNING, false)
     }
 
-    private enum class Work { PAIR, GRANT }
+    private enum class Work { PAIR, GRANT, AUTHORIZE }
 
     private class Operation(
         val kind: Work,
@@ -82,6 +92,7 @@ class WirelessSetupService : Service() {
     private var started = false
     private var finished = false
     private var paired = false
+    private var pairOnly = false
     private var pairingEndpoint: WirelessAdbEndpoint? = null
     private var connectEndpoint: WirelessAdbEndpoint? = null
     private var discovery: WirelessAdbDiscovery? = null
@@ -106,7 +117,7 @@ class WirelessSetupService : Service() {
             manager.createNotificationChannel(NotificationChannel(
                 CHANNEL, "Wireless debugging setup", NotificationManager.IMPORTANCE_LOW,
             ).apply {
-                description = "Temporary inline pairing-code reply and local permission setup"
+                description = "Temporary pairing-code reply, Settings grants and saved local update identity"
                 setSound(null, null)
                 enableVibration(false)
                 enableLights(false)
@@ -130,6 +141,8 @@ class WirelessSetupService : Service() {
         }
         when (intent?.action) {
             ACTION_START -> if (!started) {
+                pairOnly = intent.getBooleanExtra(EXTRA_PAIR_ONLY, false)
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(EXTRA_PAIR_ONLY, pairOnly).apply()
                 started = true
                 handler.postDelayed(sessionTimeout, SESSION_TIMEOUT_MS)
                 discovery = WirelessAdbDiscovery(
@@ -140,7 +153,7 @@ class WirelessSetupService : Service() {
                                 WirelessAdbDiscovery.Kind.PAIRING -> pairingEndpoint = endpoint
                                 WirelessAdbDiscovery.Kind.CONNECT -> connectEndpoint = endpoint
                             }
-                            if (paired && operation == null && connectEndpoint != null) grant()
+                            if (paired && operation == null && connectEndpoint != null) completeConnection()
                             else render()
                         }
                     },
@@ -213,10 +226,10 @@ class WirelessSetupService : Service() {
         }
     }
 
-    private fun grant() {
+    private fun completeConnection() {
         val endpoint = connectEndpoint ?: return
         handler.removeCallbacks(connectTimeout)
-        begin(Work.GRANT, endpoint, null)
+        begin(if (pairOnly) Work.AUTHORIZE else Work.GRANT, endpoint, null)
     }
 
     private fun begin(kind: Work, endpoint: WirelessAdbEndpoint, code: ByteArray?) {
@@ -234,7 +247,7 @@ class WirelessSetupService : Service() {
                 retry(if (kind == Work.PAIR) {
                     "Pairing timed out after 45 seconds. Leave Settings in front, reopen Pair device with pairing code, then reply here with the new code."
                 } else {
-                    "Local permission setup timed out after 45 seconds. Check Wi-Fi and Wireless debugging, then open a fresh pairing-code dialog and reply again."
+                    "Local ADB authorization timed out after 45 seconds. Check Wi-Fi and Wireless debugging, then open a fresh pairing-code dialog and reply again."
                 })
             }
         }
@@ -250,6 +263,7 @@ class WirelessSetupService : Service() {
                 when (kind) {
                     Work.PAIR -> current.client.pair(endpoint, code!!)
                     Work.GRANT -> grants = current.client.grant(endpoint)
+                    Work.AUTHORIZE -> current.client.authorize(endpoint)
                 }
                 succeeded = true
             } catch (error: Exception) {
@@ -287,20 +301,27 @@ class WirelessSetupService : Service() {
             paired = false
             retry("${failure.orEmpty()}\n" + if (current.kind == Work.PAIR) {
                 "Pairing failed. Keep Settings in front, close and reopen Pair device with pairing code, then reply here with the new six-digit code. Check that Wi-Fi and Wireless debugging remain on."
+            } else if (current.kind == Work.AUTHORIZE) {
+                "ADB authorization was not confirmed. Enable Wireless debugging; if Android forgot IconGen, pair again. Settings permissions were not changed."
             } else {
                 "Android did not confirm the local permission grants. Check Wi-Fi and Wireless debugging, then open a fresh pairing-code dialog and reply again.\n${WirelessGrantStatus.read(this).describe()}"
             })
         } else if (current.kind == Work.PAIR) {
             paired = true
             handler.postDelayed(connectTimeout, OPERATION_TIMEOUT_MS)
-            if (connectEndpoint != null) grant() else render()
+            if (connectEndpoint != null) completeConnection() else render()
+        } else if (current.kind == Work.AUTHORIZE) {
+            finish(
+                "Wireless ADB authorization confirmed for IconGen updates. Settings permissions were not changed. Return to IconGen and retry the update with Wireless debugging enabled.",
+                "Wireless update pairing complete", IconPackBuildService.ResultKind.SUCCESS,
+            )
         } else {
             // A successful socket exchange is insufficient: both actual Android grants must agree.
             val actual = WirelessGrantStatus.read(this)
             if (grants?.complete == true && actual.complete) {
                 BackgroundMonitorService.sync(this, refresh = true)
                 finish(
-                    "Wireless setup complete.\n${actual.describe()}\nYou can close Settings and turn Wireless debugging off.",
+                    "Wireless setup complete.\n${actual.describe()}\nThis IconGen identity is paired for updates. Keep Wireless debugging on while updating; turn it off when not using the updater. Settings grants remain separate from installation access.",
                     "Wireless setup complete", IconPackBuildService.ResultKind.SUCCESS,
                 )
             } else {
@@ -331,6 +352,7 @@ class WirelessSetupService : Service() {
         val message = when (operation?.kind) {
             Work.PAIR -> "Pairing securely with this phone. Keep the Android pairing-code dialog open; do not return to IconGen."
             Work.GRANT -> "Connected to this phone. Applying and verifying the two fixed permission grants; keep Settings open."
+            Work.AUTHORIZE -> "Checking this phone's ADB authorization for updates; Settings permissions will not be changed."
             null -> when {
                 paired -> "Pairing succeeded. Discovering this phone's Wireless debugging connection port; keep Settings open."
                 pairingEndpoint != null -> "Keep the Settings pairing-code dialog open. Expand this notification and tap Enter pairing code to reply with its six digits. Do not switch back to IconGen."
