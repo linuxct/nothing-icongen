@@ -10,6 +10,9 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import java.io.File
 
 /** Pipeline invoked only by the serialized JobScheduler worker; installation completes asynchronously. */
@@ -23,6 +26,15 @@ object IconPackBuildService {
     private const val RENDER_ERRORS_ID = 45
     private const val NOTIFICATION_TIMEOUT_MS = 60_000L
     private const val BUILD_DIR_PREFIX = "autobuild_"
+    private const val PROGRESS_THROTTLE_MS = 500L
+
+    /** Android documents that updates posted many times per second can be dropped; routine updates are coalesced. */
+    private var lastProgressPostedAt = 0L
+    private var lastProgressPhase: BuildCoordinator.Phase? = null
+    private var pendingProgress: Pair<Context, BuildCoordinator.State>? = null
+    // The handler is created at schedule time: a process-looper-bound Handler outliving a test's main looper is a hazard.
+    private var flushHandler: Handler? = null
+    private val flushRunnable = Runnable { flushProgress() }
 
     enum class ResultKind { SUCCESS, ERROR, ACTION_REQUIRED }
 
@@ -86,11 +98,47 @@ object IconPackBuildService {
 
     fun updateProgress(context: Context, state: BuildCoordinator.State) = synchronized(BuildCoordinator) {
         if (state != BuildCoordinator.state) return@synchronized
-        if (state.isRunning && !BuildCoordinator.isStopped(context)) postProgress(context, state)
-        else cancelProgress(context)
+        if (!state.isRunning || BuildCoordinator.isStopped(context)) {
+            cancelProgress(context)
+            return@synchronized
+        }
+        val elapsed = SystemClock.elapsedRealtime() - lastProgressPostedAt
+        // Milestones (N/N) and every phase transition publish immediately, even when the percent is
+        // unchanged; routine per-icon updates coalesce to ~2/s, retaining only the latest state.
+        val counts = state.detail?.split('/')
+        val forced = state.phase != lastProgressPhase || (counts?.size == 2 && counts[0] == counts[1])
+        lastProgressPhase = state.phase
+        flushHandler?.removeCallbacks(flushRunnable)
+        flushHandler = null
+        if (forced || elapsed >= PROGRESS_THROTTLE_MS) {
+            pendingProgress = null
+            lastProgressPostedAt = SystemClock.elapsedRealtime()
+            postProgress(context, state)
+        } else {
+            pendingProgress = context to state
+            val handler = Handler(Looper.getMainLooper())
+            handler.postDelayed(flushRunnable, PROGRESS_THROTTLE_MS - elapsed)
+            flushHandler = handler
+        }
     }
 
-    fun cancelProgress(context: Context) {
+    private fun flushProgress() = synchronized(BuildCoordinator) {
+        val pending = pendingProgress ?: return
+        val state = BuildCoordinator.state
+        // A terminal state arrives through updateProgress, which clears the queue before this runs.
+        if (!state.isRunning || BuildCoordinator.isStopped(pending.first)) return
+        pendingProgress = null
+        lastProgressPostedAt = SystemClock.elapsedRealtime()
+        lastProgressPhase = state.phase
+        postProgress(pending.first, state)
+    }
+
+    fun cancelProgress(context: Context) = synchronized(BuildCoordinator) {
+        pendingProgress = null
+        lastProgressPhase = null
+        lastProgressPostedAt = 0L
+        flushHandler?.removeCallbacks(flushRunnable)
+        flushHandler = null
         context.getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
     }
 

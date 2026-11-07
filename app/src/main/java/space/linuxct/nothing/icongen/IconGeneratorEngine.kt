@@ -22,13 +22,7 @@ object IconGeneratorEngine {
         try {
             IconPipeline(context).use { pipeline ->
                 for ((index, app) in apps.withIndex()) {
-                    cancellation.update {
-                        it.copy(
-                            phase = BuildCoordinator.Phase.GENERATING,
-                            message = "Generating icons (${index + 1}/${apps.size})",
-                            percent = 10 + 70 * index / apps.size,
-                        )
-                    }
+                    cancellation.checkpoint()
                     Log.d(TAG, "Rendering ${app.componentName}")
                     try {
                         val glyphs = pipeline.glyph(app.icon)
@@ -40,11 +34,29 @@ object IconGeneratorEngine {
                         renderFailures.add(app.componentName to e)
                     }
                     cancellation.checkpoint()
+                    // Report finished work, so a notification dropped at the last icon cannot strand an old count.
+                    val completed = index + 1
+                    cancellation.update {
+                        it.copy(
+                            phase = BuildCoordinator.Phase.GENERATING,
+                            message = "Generating icons ($completed/${apps.size})",
+                            percent = 10 + 70 * completed / apps.size,
+                            detail = "$completed/${apps.size}",
+                        )
+                    }
                 }
             }
             check(entries.isNotEmpty()) { "Nothing renderer failed for all ${apps.size} apps" }
             if (entries.size < apps.size) Log.w(TAG, "Skipped ${apps.size - entries.size} of ${apps.size} apps")
             cancellation.checkpoint()
+            cancellation.update {
+                it.copy(
+                    phase = BuildCoordinator.Phase.GENERATING,
+                    message = "Preparing resources (${apps.size}/${apps.size})",
+                    percent = 80,
+                    detail = "${apps.size}/${apps.size}",
+                )
+            }
             return IconPackAssembler.assembleZip(context, outputDir, entries, palette, cancellation)
         } finally {
             entries.forEach { it.glyphs.recycle() }
