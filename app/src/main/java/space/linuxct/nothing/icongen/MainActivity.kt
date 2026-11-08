@@ -376,10 +376,22 @@ class MainActivity : AppCompatActivity() {
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         }, 12)
         if (running) {
-            ui.add(content, ProgressBar(this).apply {
-                isIndeterminate = true
-                indeterminateTintList = android.content.res.ColorStateList.valueOf(ui.ink)
-            }, 16)
+            if (status.phase == AppSelfUpdater.Phase.DOWNLOADING) {
+                ui.add(content, ui.text("Downloaded ${status.downloadPercent}%", 14f, muted = true).apply {
+                    accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+                }, 16)
+                ui.add(content, ProgressBar(this).apply {
+                    isIndeterminate = false
+                    max = 100
+                    progress = status.downloadPercent
+                    progressTintList = android.content.res.ColorStateList.valueOf(ui.ink)
+                }, 4)
+            } else {
+                ui.add(content, ProgressBar(this).apply {
+                    isIndeterminate = true
+                    indeterminateTintList = android.content.res.ColorStateList.valueOf(ui.ink)
+                }, 16)
+            }
         }
         val preinstall = status.phase == AppSelfUpdater.Phase.DISCOVERING ||
             status.phase == AppSelfUpdater.Phase.DOWNLOADING || status.phase == AppSelfUpdater.Phase.VERIFYING

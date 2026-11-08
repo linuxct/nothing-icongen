@@ -104,8 +104,12 @@ class AppSelfUpdateService : Service() {
         val builder = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CHANNEL_ID) else Notification.Builder(this)
         return builder.setSmallIcon(R.drawable.ic_launcher_monochrome)
             .setContentTitle(if (ongoing) "Updating IconGen" else if (status.phase == AppSelfUpdater.Phase.DONE) "IconGen updated" else "IconGen update needs attention")
-            .setContentText(status.message)
-            .setStyle(Notification.BigTextStyle().bigText(status.message))
+            .apply {
+                val percent = if (ongoing && status.phase == AppSelfUpdater.Phase.DOWNLOADING)
+                    " ${status.downloadPercent}%" else ""
+                setContentText(status.message + percent)
+                setStyle(Notification.BigTextStyle().bigText(status.message + percent))
+            }
             .setContentIntent(intent)
             .setOngoing(ongoing)
             .setOnlyAlertOnce(true)

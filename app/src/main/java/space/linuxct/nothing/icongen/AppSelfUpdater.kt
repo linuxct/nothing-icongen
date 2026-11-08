@@ -17,7 +17,7 @@ import java.util.concurrent.TimeUnit
 internal object AppSelfUpdater {
     const val PREFS = "app_self_update"
     enum class Phase { IDLE, DISCOVERING, DOWNLOADING, VERIFYING, INSTALLING, DONE, FAILED }
-    data class Status(val phase: Phase, val message: String, val version: String?, val needsWirelessSetup: Boolean)
+    data class Status(val phase: Phase, val message: String, val version: String?, val needsWirelessSetup: Boolean, val downloadPercent: Int)
     private const val EXPECTED = "expected_version"
     private const val EXPECTED_CODE = "expected_version_code"
     private const val HANDOFF_AT = "handoff_at"
@@ -42,7 +42,8 @@ internal object AppSelfUpdater {
         val prefs = prefs(context)
         return Status(runCatching { Phase.valueOf(prefs.getString("phase", "IDLE")!!) }.getOrDefault(Phase.IDLE),
             prefs.getString("message", "Updates install only after you choose Update now.").orEmpty(),
-            prefs.getString("version", null), prefs.getBoolean("wireless_setup_required", false))
+            prefs.getString("version", null), prefs.getBoolean("wireless_setup_required", false),
+            prefs.getInt("download_percent", 0))
     }
 
     @Synchronized fun isRunning(context: Context): Boolean = operation != null
@@ -155,9 +156,20 @@ internal object AppSelfUpdater {
             apk = File.createTempFile("icongen-self-update-", ".apk", context.cacheDir)
             update(context, Phase.DOWNLOADING, "Downloading IconGen ${task.release.version} from the official release.", task.release.version)
             changed()
-            AppUpdateArtifact.download(task.release, apk, { checkActive(task) }) { connection ->
+            var lastPercent = 0
+            var lastReportAt = 0L
+            AppUpdateArtifact.download(task.release, apk, { checkActive(task) }, { connection ->
                 task.connection = connection
                 if (task.cancelled != null) connection?.disconnect()
+            }) { copied, total ->
+                val percent = (copied * 100 / total).toInt()
+                // Coalesce to whole percents at ~2/s: Android drops notification updates posted many times per second.
+                if (percent > lastPercent && SystemClock.elapsedRealtime() - lastReportAt >= 500L) {
+                    lastPercent = percent
+                    lastReportAt = SystemClock.elapsedRealtime()
+                    setDownloadPercent(context, percent)
+                    changed()
+                }
             }
             checkActive(task)
             update(context, Phase.VERIFYING, "Checking the APK signature, package, version and installed signing certificate.", task.release.version)
@@ -284,12 +296,19 @@ internal object AppSelfUpdater {
             .putString("phase", Phase.DONE.name).putString("version", expected)
             .putBoolean("running", operation != null)
             .putBoolean("wireless_setup_required", false)
+            .putInt("download_percent", 0)
             .putString("message", "IconGen $expected is installed and verified.").commit()
     }
 
     private fun update(context: Context, phase: Phase, message: String, version: String?, needsWirelessSetup: Boolean = false) {
         prefs(context).edit().putString("phase", phase.name).putString("message", message)
             .putString("version", version).putBoolean("running", operation != null)
-            .putBoolean("wireless_setup_required", needsWirelessSetup).apply()
+            .putBoolean("wireless_setup_required", needsWirelessSetup)
+            .putInt("download_percent", 0).apply()
+    }
+
+    /** Download bytes land every few ms; the UI needs whole percents, not a write per chunk. */
+    @Synchronized private fun setDownloadPercent(context: Context, percent: Int) {
+        prefs(context).edit().putInt("download_percent", percent.coerceIn(0, 100)).apply()
     }
 }

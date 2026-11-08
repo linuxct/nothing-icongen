@@ -65,13 +65,18 @@ class AppUpdateArtifactTest {
         val bytes = ByteArray(2048) { it.toByte() }
         val digest = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
         val file = temporary.newFile()
-        AppUpdateArtifact.copyVerified(ByteArrayInputStream(bytes), file, 2048, digest) { }
+        AppUpdateArtifact.copyVerified(ByteArrayInputStream(bytes), file, 2048, digest)
+        val progress = ArrayList<Pair<Long, Long>>()
+        AppUpdateArtifact.copyVerified(ByteArrayInputStream(bytes), file, 2048, digest, {}) { copied, total -> progress += copied to total }
+        assertEquals(listOf(2048L to 2048L), progress.takeLast(1))
+        assertTrue(progress.zipWithNext().all { (previous, next) -> previous.first < next.first })
+        assertTrue(progress.all { it.second == 2048L })
         assertArrayEquals(bytes, file.readBytes())
-        rejects { AppUpdateArtifact.copyVerified(ByteArrayInputStream(bytes), file, 2048, "0".repeat(64)) { } }
+        rejects { AppUpdateArtifact.copyVerified(ByteArrayInputStream(bytes), file, 2048, "0".repeat(64)) }
         assertFalse(file.exists())
-        rejects { AppUpdateArtifact.copyVerified(ByteArrayInputStream(bytes), file, 2049, null) { } }
+        rejects { AppUpdateArtifact.copyVerified(ByteArrayInputStream(bytes), file, 2049, null) }
         assertFalse(file.exists())
-        rejects { AppUpdateArtifact.copyVerified(ByteArrayInputStream(bytes), file, 2047, null) { } }
+        rejects { AppUpdateArtifact.copyVerified(ByteArrayInputStream(bytes), file, 2047, null) }
         assertFalse(file.exists())
     }
 
@@ -79,9 +84,9 @@ class AppUpdateArtifactTest {
         val file = temporary.newFile()
         var checks = 0
         try {
-            AppUpdateArtifact.copyVerified(ByteArrayInputStream(ByteArray(128 * 1024)), file, 128 * 1024L, null) {
-                if (++checks == 2) throw CancellationException("cancelled")
-            }
+            AppUpdateArtifact.copyVerified(ByteArrayInputStream(ByteArray(128 * 1024)), file, 128 * 1024L, null,
+                checkActive = { if (++checks == 2) throw CancellationException("cancelled") }
+            )
             fail("Cancellation was ignored")
         } catch (_: CancellationException) { }
         assertFalse(file.exists())

@@ -52,6 +52,7 @@ internal object AppUpdateArtifact {
         file: File,
         checkActive: () -> Unit,
         connectionChanged: (HttpURLConnection?) -> Unit,
+        onProgress: (copied: Long, total: Long) -> Unit = { _, _ -> },
     ) {
         var url = URL(release.apk.url)
         try {
@@ -78,7 +79,7 @@ internal object AppUpdateArtifact {
                             val encoding = connection.contentEncoding
                             require(encoding == null || encoding.equals("identity", true)) { "Unexpected compressed APK response." }
                             connection.inputStream.use { input ->
-                                copyVerified(input, file, release.apk.size, release.apk.sha256, checkActive)
+                                copyVerified(input, file, release.apk.size, release.apk.sha256, checkActive, onProgress)
                             }
                             return
                         }
@@ -96,7 +97,8 @@ internal object AppUpdateArtifact {
         error("APK download did not complete.")
     }
 
-    internal fun copyVerified(input: InputStream, file: File, expectedSize: Long, sha256: String?, checkActive: () -> Unit) {
+    internal fun copyVerified(input: InputStream, file: File, expectedSize: Long, sha256: String?,
+                              checkActive: () -> Unit = { }, onProgress: (copied: Long, total: Long) -> Unit = { _, _ -> }) {
         require(expectedSize in MIN_BYTES..MAX_BYTES) { "Unsafe APK size." }
         val digest = MessageDigest.getInstance("SHA-256")
         var count = 0L
@@ -111,6 +113,7 @@ internal object AppUpdateArtifact {
                     require(count <= expectedSize && count <= MAX_BYTES) { "The APK exceeds the advertised download size." }
                     digest.update(buffer, 0, size)
                     output.write(buffer, 0, size)
+                    onProgress(count, expectedSize)
                 }
                 checkActive()
                 require(count == expectedSize) { "The APK download was incomplete." }
