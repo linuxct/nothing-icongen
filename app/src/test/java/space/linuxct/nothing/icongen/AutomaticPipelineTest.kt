@@ -21,6 +21,8 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.Implementation
+import org.robolectric.annotation.Implements
 
 /** Durable operation fixtures exercise production transitions without compiling/installing APKs. */
 @RunWith(RobolectricTestRunner::class)
@@ -29,8 +31,44 @@ class AutomaticPipelineTest {
     private val context: Context get() = RuntimeEnvironment.getApplication()
     private fun prefs(name: String) = context.getSharedPreferences(name, Context.MODE_PRIVATE)
 
+    @Implements(android.content.pm.LauncherApps::class)
+    class UnavailableProfileLauncherApps {
+        @Implementation
+        fun getProfiles(): List<android.os.UserHandle> =
+            listOf(android.os.Process.myUserHandle(), android.os.UserHandle.getUserHandleForUid(1_000_000))
+
+        @Implementation
+        fun getActivityList(packageName: String?, user: android.os.UserHandle):
+            List<android.content.pm.LauncherActivityInfo> {
+            if (user != android.os.Process.myUserHandle()) throw SecurityException("Profile locked")
+            return emptyList()
+        }
+    }
+
+    @Test
+    @Config(shadows = [UnavailableProfileLauncherApps::class])
+    fun unavailableProfileDoesNotBlockAccessibleUpdatesOrEraseItsObservedIdentities() {
+        val users = context.getSystemService(android.os.UserManager::class.java)
+        val serial = users.getSerialNumberForUser(android.os.UserHandle.getUserHandleForUid(1_000_000))
+        val hiddenKey = "$serial:example.work"
+        val baseline = PackageChangeMonitor.identities(context) + (hiddenKey to "work-source")
+        PackageChangeMonitor.reconcileSnapshot(context, baseline)
+        DirtyIconQueue.record(context, mapOf(hiddenKey to "work-source"))
+        installedPackage("example.new")
+
+        PackageChangeMonitor.reconcile(context)
+
+        assertEquals(1L, prefs("build_queue").getLong("requested", 0))
+        assertEquals("work-source", org.json.JSONObject(prefs("package_monitor")
+            .getString("observed_packages", "{}")!!).getString(hiddenKey))
+        assertEquals(setOf("example.work", "example.new"), DirtyIconQueue.snapshot(context)
+            .entries.keys.map { it.substringAfter(':') }.toSet())
+        assertNotNull(context.getSystemService(JobScheduler::class.java)
+            .getPendingJob(BuildCoordinator.WARM_JOB_ID))
+    }
+
     @Before fun setUp() {
-        for (name in listOf("build_queue", "install_state", "auto_update", "package_monitor", "onboarding", "theme_refresh")) {
+        for (name in listOf("build_queue", "icon_preparation", "install_state", "auto_update", "package_monitor", "onboarding", "theme_refresh")) {
             prefs(name).edit().clear().commit()
         }
         OnboardingState.markComplete(context)
@@ -51,13 +89,33 @@ class AutomaticPipelineTest {
     }
 
 
-    private fun installedPackage(name: String = "example.probe", version: Long = 1) {
+    private fun installedPackage(name: String = "example.probe", version: Long = 1, source: File? = null) {
         shadowOf(context.packageManager).installPackage(PackageInfo().apply {
             packageName = name
-            applicationInfo = ApplicationInfo().apply { packageName = name }
+            applicationInfo = ApplicationInfo().apply {
+                packageName = name
+                sourceDir = source?.absolutePath
+            }
             setLongVersionCode(version)
             lastUpdateTime = version * 1000
         })
+    }
+
+    @Test fun directIdentityMatchesInventoryAndDoesNotExcludeBundledArtworkSources() {
+        val source = File(context.cacheDir, "identity-fixture.apk").apply { writeText("source") }
+        val user = android.os.Process.myUserHandle()
+        try {
+            installedPackage(source = source, version = 7)
+            val key = PackageChangeMonitor.identities(context).keys.single { it.endsWith(":example.probe") }
+            assertEquals(PackageChangeMonitor.identities(context).getValue(key),
+                PackageChangeMonitor.identity(context, user, "example.probe"))
+            installedPackage(PackageChangeReceiver.PACK_PACKAGE, version = 8, source = source)
+            assertEquals("8:8000", PackageChangeMonitor.identity(context, user, PackageChangeReceiver.PACK_PACKAGE))
+            assertFalse(PackageChangeMonitor.identities(context).keys.any { it.endsWith(":${PackageChangeReceiver.PACK_PACKAGE}") })
+            source.delete()
+            assertNull(PackageChangeMonitor.identity(context, user, "example.probe"))
+            assertNull(PackageChangeMonitor.identity(context, user, "example.absent"))
+        } finally { source.delete() }
     }
     @Test fun replacementBroadcastsProduceOneRequestAndOwnPackagesProduceNone() {
         PackageChangeMonitor.reconcile(context)
@@ -240,6 +298,7 @@ class AutomaticPipelineTest {
         PackageChangeMonitor.reconcile(context)
         assertEquals(0L, prefs("build_queue").getLong("requested", 0))
         assertNotNull(prefs("package_monitor").getString("observed_packages", null))
+        assertTrue(DirtyIconQueue.snapshot(context).entries.isEmpty())
     }
 
     @Test fun periodicReconciliationDetectsRealInstallAndUpdateAfterProcessStateReset() {
@@ -296,6 +355,8 @@ class AutomaticPipelineTest {
         assertEquals(0L, prefs("build_queue").getLong("requested", 0))
         change(Intent.ACTION_PACKAGE_ADDED, "example.new")
         assertEquals(1L, prefs("build_queue").getLong("requested", 0))
+        assertEquals(setOf("example.new"), DirtyIconQueue.snapshot(context).entries.keys
+            .map { it.substringAfter(':') }.toSet())
     }
 
     @Test fun removalsAndConfigurationChangesOnlyConsumeBaseline() {
@@ -345,6 +406,30 @@ class AutomaticPipelineTest {
         installedPackage(version = 2)
         PackageChangeMonitor.reconcile(context)
         assertEquals(3L, prefs("build_queue").getLong("requested", 0))
+    }
+
+    @Test fun authoritativeFirstInstallDoesNotWarmEveryPreexistingPackage() {
+        installedPackage("example.existing")
+        installedPackage("example.new")
+        change(Intent.ACTION_PACKAGE_ADDED, "example.new")
+        assertEquals(setOf("example.new"), DirtyIconQueue.snapshot(context).entries.keys
+            .map { it.substringAfter(':') }.toSet())
+        assertNotNull(context.getSystemService(JobScheduler::class.java).getPendingJob(BuildCoordinator.WARM_JOB_ID))
+        assertNull(context.getSystemService(JobScheduler::class.java).getPendingJob(BuildCoordinator.JOB_ID))
+        assertEquals(1L, prefs("build_queue").getLong("requested", 0))
+    }
+
+    @Test fun removalBeforeFirstBaselineDoesNotTurnExistingPackagesIntoInstalls() {
+        installedPackage("example.existing")
+        change(Intent.ACTION_PACKAGE_REMOVED, "example.absent")
+        PackageChangeMonitor.reconcile(context)
+        assertEquals(0L, prefs("build_queue").getLong("requested", 0))
+        assertTrue(DirtyIconQueue.snapshot(context).entries.isEmpty())
+        installedPackage("example.new")
+        change(Intent.ACTION_PACKAGE_ADDED, "example.new")
+        assertEquals(setOf("example.new"), DirtyIconQueue.snapshot(context).entries.keys
+            .map { it.substringAfter(':') }.toSet())
+        assertEquals(1L, prefs("build_queue").getLong("requested", 0))
     }
 
     @Test fun stopDiscardsPermissionRecoveryAndLateInstallerCallbacks() {

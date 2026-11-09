@@ -23,13 +23,24 @@ class IconPackBuildJobService : JobService() {
         val run = Run(params)
         runs[params.jobId] = run
         worker.execute {
+            var retry = false
             try {
-                if (params.jobId == PackageChangeMonitor.JOB_ID) {
-                    if (!run.stopped) PackageChangeMonitor.reconcile(applicationContext)
+                if (params.jobId == DailyIconCacheCleanup.JOB_ID) {
+                    DailyIconCacheCleanup.run(applicationContext, { run.stopped })
+                } else if (params.jobId == PackageChangeMonitor.JOB_ID) {
+                    if (!run.stopped) {
+                        PackageChangeMonitor.reconcile(applicationContext)
+                        DailyIconCacheCleanup.ensureScheduled(applicationContext)
+                        BuildCoordinator.resumeQueued(applicationContext)
+                    }
                 } else {
                     while (!run.stopped) {
                         val work = params.dequeueWork() ?: break
-                        BuildCoordinator.runPending(applicationContext) { run.stopped }
+                        if (params.jobId == BuildCoordinator.WARM_JOB_ID) {
+                            BuildCoordinator.runPreparation(applicationContext, { run.stopped })
+                        } else {
+                            BuildCoordinator.runPending(applicationContext) { run.stopped }
+                        }
                         if (!run.stopped) params.completeWork(work)
                     }
                 }
@@ -39,9 +50,16 @@ class IconPackBuildJobService : JobService() {
                 run.stopped = true
                 Log.w("IconPackBuildJobService", "Job callback expired id=${params.jobId}; retaining queued work", expired)
                 BuildCoordinator.waitingForScheduler(applicationContext)
+            } catch (failure: Exception) {
+                // Leave uncompleted items and dirty identities durable for scheduler redelivery.
+                retry = true
+                Log.e("IconPackBuildJobService", "Job failed id=${params.jobId}; retaining queued work", failure)
             } finally {
                 runs.remove(params.jobId, run)
-                if (!run.stopped) jobFinished(params, false)
+                if (!run.stopped) jobFinished(params, retry)
+                if (!run.stopped && !retry && params.jobId == DailyIconCacheCleanup.JOB_ID) {
+                    DailyIconCacheCleanup.ensureScheduled(applicationContext, replace = true)
+                }
             }
         }
         return true

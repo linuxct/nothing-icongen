@@ -40,8 +40,10 @@ object BuildCoordinator {
     private const val FIRST_SETTLE_MS = 5_000L
     private const val BURST_SETTLE_MS = 30_000L
     private var active: Cancellation? = null
+    private var activePreparation: Cancellation? = null
     const val JOB_ID = 4401
     const val SETTLE_JOB_ID = 4404
+    const val WARM_JOB_ID = 4410
 
     /** Captured before dispatch, so queued threads cannot escape a subsequent Stop. */
     class Cancellation internal constructor(
@@ -179,8 +181,12 @@ object BuildCoordinator {
                 .putLong(COMPLETED, prefs.getLong(REQUESTED, 0))
                 .putString(STOPPED_MESSAGE, "All generation stopped").commit()
             active?.cancel()
+            activePreparation?.cancel()
+            DirtyIconQueue.discard(context)
             update { State(phase = Phase.STOPPED, message = "All generation stopped") }
-            context.getSystemService(JobScheduler::class.java).run { cancel(JOB_ID); cancel(SETTLE_JOB_ID) }
+            context.getSystemService(JobScheduler::class.java).run {
+                cancel(JOB_ID); cancel(SETTLE_JOB_ID); cancel(WARM_JOB_ID)
+            }
         }
         val message = IconPackInstaller.stopPending(context)
         synchronized(this) {
@@ -194,10 +200,16 @@ object BuildCoordinator {
     }
 
     fun setAutoUpdateEnabled(context: Context, enabled: Boolean) {
-        // Enabling is not an installation event. Consume changes made while disabled.
-        PackageChangeMonitor.observeCurrent(context)
+        // A warm lease is independent of manual generation's cancellation generation.
         context.getSharedPreferences(PackageChangeReceiver.PREFS, Context.MODE_PRIVATE).edit()
             .putBoolean(PackageChangeReceiver.KEY_ENABLED, enabled).commit()
+        synchronized(this) {
+            activePreparation?.cancel()
+            DirtyIconQueue.discard(context)
+            context.getSystemService(JobScheduler::class.java).cancel(WARM_JOB_ID)
+        }
+        // Enabling is not an installation event. Consume changes made while disabled.
+        PackageChangeMonitor.observeCurrent(context)
         if (enabled) PackageChangeMonitor.ensureScheduled(context)
         else context.getSystemService(JobScheduler::class.java).cancel(PackageChangeMonitor.JOB_ID)
     }
@@ -226,6 +238,7 @@ object BuildCoordinator {
 
     @Synchronized fun resumeQueued(context: Context) {
         if (!OnboardingState.isComplete(context)) return
+        resumePreparation(context)
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         if (prefs.getLong(REQUESTED, 0) > prefs.getLong(COMPLETED, 0)) {
             if (!state.isRunning && state.phase != Phase.WAITING_PERMISSION && state.phase != Phase.WAITING_CONFIRMATION) {
@@ -297,6 +310,66 @@ object BuildCoordinator {
                 } catch (_: CancellationException) { return }
             } finally {
                 synchronized(this) { if (active === cancellation) active = null }
+            }
+        }
+    }
+
+    internal fun automationEnabled(context: Context): Boolean =
+        OnboardingState.isComplete(context) && autoUpdateEnabled(context)
+
+    /** An independent finite job can render during the build's persisted quiet period. */
+    @Synchronized internal fun resumePreparation(context: Context) {
+        if (!automationEnabled(context) || isStopped(context)) return
+        val snapshot = DirtyIconQueue.snapshot(context)
+        if (snapshot.entries.isEmpty()) return
+        val scheduler = context.getSystemService(JobScheduler::class.java)
+        scheduler.enqueue(JobInfo.Builder(WARM_JOB_ID,
+            ComponentName(context, IconPackBuildJobService::class.java)).setOverrideDeadline(0).build(),
+            JobWorkItem(Intent()))
+        // Failure is recoverable: reconciliation/startup will see the same durable lease.
+    }
+
+    /** Called only by the process-wide worker; no rendering under monitor/UI locks. */
+    internal fun runPreparation(
+        context: Context,
+        stopped: () -> Boolean,
+        inventory: () -> Map<String, String> = { PackageChangeMonitor.identities(context) },
+        prepare: (Set<String>, Cancellation) -> Unit = { packages, cancellation ->
+            IconGeneratorEngine.warmPackages(context, packages, cancellation)
+        },
+    ) {
+        val snapshot: DirtyIconQueue.Snapshot
+        val cancellation: Cancellation
+        synchronized(this) {
+            if (stopped() || !automationEnabled(context) || isStopped(context)) return
+            snapshot = DirtyIconQueue.snapshot(context)
+            cancellation = BuildCoordinator.cancellation(context) {
+                stopped() || !automationEnabled(context) || isStopped(context) ||
+                    !DirtyIconQueue.isCurrent(context, snapshot)
+            }
+            activePreparation = cancellation
+        }
+        try {
+            cancellation.checkpoint()
+            for ((packageName, entries) in snapshot.entries.entries.groupBy { it.key.substringAfter(':') }) {
+                cancellation.checkpoint()
+                val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                // Once quiet has expired the final build fills misses; do not delay it with warming.
+                if (System.currentTimeMillis() >= prefs.getLong(DEFER_UNTIL, 0)) break
+                val before = inventory()
+                val valid = entries.filter { before[it.key] == it.value.identity }.associate { it.toPair() }
+                if (valid.isEmpty()) continue // Inaccessible profiles and missed updates stay durable.
+                prepare(setOf(packageName), cancellation)
+                cancellation.checkpoint()
+                val after = inventory()
+                cancellation.checkpoint()
+                DirtyIconQueue.acknowledge(context, snapshot.copy(entries = valid), after)
+            }
+        } catch (_: CancellationException) {
+            // Framework interruption retains leases; explicit Stop/off discards them itself.
+        } finally {
+            synchronized(this) {
+                if (activePreparation === cancellation) activePreparation = null
             }
         }
     }

@@ -7,10 +7,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.LauncherApps
+import android.content.pm.PackageManager
 import android.os.Process
 import android.os.Handler
 import android.os.Looper
 import android.os.UserManager
+import android.os.UserHandle
 import android.util.Log
 import java.io.File
 import java.security.MessageDigest
@@ -52,6 +54,7 @@ object PackageChangeMonitor {
     }
 
     fun ensureScheduled(context: Context) {
+        DailyIconCacheCleanup.ensureScheduled(context)
         val scheduler = context.getSystemService(JobScheduler::class.java)
         if (!OnboardingState.isComplete(context) ||
             !context.getSharedPreferences(PackageChangeReceiver.PREFS, Context.MODE_PRIVATE)
@@ -70,8 +73,18 @@ object PackageChangeMonitor {
     }
 
     /** Package/profile identities deliberately exclude components, theme and permission state. */
-    private fun identities(context: Context): Map<String, String> {
+    internal fun identities(context: Context): Map<String, String> = scanIdentities(context).records
+
+    private data class IdentityInventory(
+        val records: Map<String, String>,
+        val unavailable: Set<Long>,
+        val currentProfile: Long,
+        val profilesUnavailable: Boolean,
+    )
+
+    private fun scanIdentities(context: Context): IdentityInventory {
         val records = HashMap<String, String>()
+        val unavailable = HashSet<Long>()
         val users = context.getSystemService(UserManager::class.java)
         val currentUser = Process.myUserHandle()
         val currentProfile = users.getSerialNumberForUser(currentUser)
@@ -82,10 +95,17 @@ object PackageChangeMonitor {
             records["$currentProfile:${info.packageName}"] = "${info.longVersionCode}:${info.lastUpdateTime}"
         }
         val launcherApps = context.getSystemService(LauncherApps::class.java)
-        for (user in launcherApps.profiles) {
+        val profiles = try { launcherApps.profiles } catch (_: SecurityException) { null }
+        for (user in profiles.orEmpty()) {
             if (user == currentUser) continue
             val profile = users.getSerialNumberForUser(user)
-            for (activity in launcherApps.getActivityList(null, user)) {
+            val activities = try {
+                launcherApps.getActivityList(null, user)
+            } catch (_: SecurityException) {
+                unavailable.add(profile)
+                continue
+            }
+            for (activity in activities) {
                 val packageName = activity.componentName.packageName
                 if (excluded(context, packageName)) continue
                 // The current-user PackageManager can report the wrong profile's version.
@@ -95,7 +115,47 @@ object PackageChangeMonitor {
                     "${activity.firstInstallTime}:${source.absolutePath}:${source.lastModified()}:${source.length()}"
             }
         }
+        return IdentityInventory(records, unavailable, currentProfile, profiles == null)
+    }
+
+    /** An inaccessible profile is unknown, not an authoritative empty installation inventory. */
+    private fun observedIdentities(context: Context): Map<String, String> {
+        val inventory = scanIdentities(context)
+        if (inventory.unavailable.isEmpty() && !inventory.profilesUnavailable) return inventory.records
+        val records = inventory.records.toMutableMap()
+        val previous = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(OBSERVED, null)?.let(::JSONObject) ?: return records
+        for (key in previous.keys()) {
+            val profile = key.substringBefore(':').toLongOrNull() ?: continue
+            if (profile in inventory.unavailable ||
+                (inventory.profilesUnavailable && profile != inventory.currentProfile)) {
+                records.putIfAbsent(key, previous.getString(key))
+            }
+        }
         return records
+    }
+
+    /** Revalidates one source without rescanning all visible packages; deliberately no exclusions. */
+    internal fun identity(context: Context, user: UserHandle, packageName: String): String? {
+        return try {
+            if (user == Process.myUserHandle()) {
+                @Suppress("DEPRECATION")
+                val info = context.packageManager.getPackageInfo(packageName, 0)
+                val source = info.applicationInfo?.sourceDir?.let(::File) ?: return null
+                if (!source.isFile || !source.canRead()) return null
+                "${info.longVersionCode}:${info.lastUpdateTime}"
+            } else {
+                val activity = context.getSystemService(LauncherApps::class.java)
+                    .getActivityList(packageName, user).firstOrNull() ?: return null
+                val source = activity.applicationInfo.sourceDir?.let(::File) ?: return null
+                if (!source.isFile || !source.canRead()) return null
+                "${activity.firstInstallTime}:${source.absolutePath}:${source.lastModified()}:${source.length()}"
+            }
+        } catch (_: PackageManager.NameNotFoundException) {
+            null
+        } catch (_: SecurityException) {
+            null
+        }
     }
 
     private fun excluded(context: Context, packageName: String) =
@@ -108,51 +168,56 @@ object PackageChangeMonitor {
     }
 
     @Synchronized
-    fun reconcile(context: Context) = reconcileSnapshot(context, identities(context))
+    fun reconcile(context: Context) = reconcileSnapshot(context, observedIdentities(context))
 
     /** Toggling monitoring consumes the current baseline without manufacturing an app event. */
     @Synchronized
     fun observeCurrent(context: Context) {
-        reconcileSnapshot(context, identities(context), allowBuild = false)
+        reconcileSnapshot(context, observedIdentities(context), allowBuild = false)
     }
 
     @Synchronized
     fun packageAdded(context: Context, packageName: String) {
-        reconcileSnapshot(context, identities(context), addedPackage = packageName)
+        reconcileSnapshot(context, observedIdentities(context), addedPackage = packageName)
     }
 
     /** Removal must not consume another package's install/update awaiting its broadcast. */
     @Synchronized
     fun packageRemoved(context: Context, packageName: String) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val saved = prefs.getString(OBSERVED, null) ?: return
-        val previous = JSONObject(saved)
-        val current = identities(context)
-        val removed = previous.keys().asSequence().filter {
+        val saved = prefs.getString(OBSERVED, null)
+        val previous = saved?.let(::JSONObject) ?: JSONObject()
+        val current = observedIdentities(context)
+        val removed = (previous.keys().asSequence().toSet() + DirtyIconQueue.snapshot(context).entries.keys).filter {
             it.substringAfter(':') == packageName && it !in current
-        }.toList()
+        }
         removed.forEach(previous::remove)
-        prefs.edit().putString(OBSERVED, previous.toString()).commit()
+        DirtyIconQueue.remove(context, removed)
+        if (saved != null) prefs.edit().putString(OBSERVED, previous.toString()).commit()
     }
 
-    /** Persist observation BEFORE requesting work: stopped/failed requests are not scan-replayed. */
+    /** Dirty identities precede observation and scheduling, so interrupted preparation is recoverable. */
     @Synchronized
-    private fun reconcileSnapshot(context: Context, current: Map<String, String>,
+    internal fun reconcileSnapshot(context: Context, current: Map<String, String>,
                                    addedPackage: String? = null, allowBuild: Boolean = true) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val previous = prefs.getString(OBSERVED, null)?.let(::JSONObject)
-        val changed = if (previous == null) {
-            // An authoritative live install event can precede the application's first baseline.
-            addedPackage != null && current.keys.any { it.substringAfter(':') == addedPackage }
-        } else current.any { (key, identity) -> !previous.has(key) || previous.getString(key) != identity }
+        val changed = current.filter { (key, identity) ->
+            if (previous == null) {
+                // A live install can precede the application's first baseline.
+                key.substringAfter(':') == addedPackage
+            } else !previous.has(key) || previous.getString(key) != identity
+        }
+        val enabled = BuildCoordinator.automationEnabled(context)
+        if (allowBuild && enabled) DirtyIconQueue.record(context, changed)
         prefs.edit().putString(OBSERVED, JSONObject(current).toString()).commit()
-        val enabled = context.getSharedPreferences(PackageChangeReceiver.PREFS, Context.MODE_PRIVATE)
-            .getBoolean(PackageChangeReceiver.KEY_ENABLED, true)
-        Log.d("PackageChangeMonitor", "Observed ${current.size} packages installOrUpdate=$changed enabled=$enabled")
-        if (changed && allowBuild && enabled && OnboardingState.isComplete(context)) {
+        Log.d("PackageChangeMonitor", "Observed ${current.size} packages installOrUpdate=${changed.size} enabled=$enabled")
+        if (changed.isNotEmpty() && allowBuild && enabled) {
             BuildCoordinator.start(context, "package:install-or-update")
         }
+        if (allowBuild && enabled) BuildCoordinator.resumePreparation(context)
     }
+
 
     /** Only the snapshot taken BEFORE the successful build is acknowledged. */
     fun installed(context: Context, fingerprint: String) {

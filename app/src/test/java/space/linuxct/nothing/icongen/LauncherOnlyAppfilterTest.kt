@@ -20,13 +20,29 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
+import org.robolectric.annotation.Implementation
+import org.robolectric.annotation.Implements
+import org.robolectric.shadows.ShadowLinux
 import org.xmlpull.v1.XmlPullParser
 
 /** Exercises consumer lookup semantics, not the installed launcher's rendering pipeline. */
 @RunWith(RobolectricTestRunner::class)
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
-@Config(application = Application::class, sdk = [35])
+@Config(application = Application::class, sdk = [35], shadows = [LauncherOnlyAppfilterTest.HardLinkLinux::class])
 class LauncherOnlyAppfilterTest {
+    // Robolectric's Linux shadow has no link() implementation; use a real host hard link.
+    @Implements(className = "libcore.io.Linux", isInAndroidSdk = false)
+    class HardLinkLinux : ShadowLinux() {
+        @Implementation
+        fun link(source: String, destination: String) {
+            try {
+                java.nio.file.Files.createLink(java.nio.file.Path.of(destination), java.nio.file.Path.of(source))
+            } catch (failure: java.io.IOException) {
+                throw android.system.ErrnoException("link", android.system.OsConstants.EIO, failure)
+            }
+        }
+    }
+
     @Test fun packageDefaultsOptOutWhileEveryActivityStillLoadsGeneratedArtwork() {
         val context = RuntimeEnvironment.getApplication()
         val output = File(context.cacheDir, "launcher-only-appfilter")
@@ -44,10 +60,24 @@ class LauncherOnlyAppfilterTest {
             LauncherGlyphs(glyph)
         }
         try {
-            val zip = IconPackAssembler.assembleZip(
-                context,
-                output,
-                components.mapIndexed { index, name -> IconPackAssembler.PackEntry(name, name, glyphs[index]) },
+            val entries = PackIconEncoder().use { encoder ->
+                components.mapIndexed { index, name ->
+                    val files = listOf(false, true).map { dark ->
+                        val palette = ThemeColors.resolve(context, dark)
+                        val artwork = IconArtwork.buildIcon(palette, glyphs[index].forColor(palette.foreground))
+                        val file = File(context.cacheDir, "appfilter_${index}_$dark.png")
+                        try {
+                            val encoded = encoder.encode(artwork)
+                            try { file.outputStream().use { check(encoded.compress(Bitmap.CompressFormat.PNG, 100, it)) } }
+                            finally { encoded.recycle() }
+                        } finally { artwork.recycle() }
+                        file
+                    }
+                    IconPackAssembler.PackEntry(name, name, files[0], files[1])
+                }
+            }
+            IconPackAssembler.prepareResources(
+                context, output, entries,
                 ThemeColors.Palette(0xFF272B2D.toInt(), 0x66FFFFFF, false),
             )
             try {
@@ -93,7 +123,31 @@ class LauncherOnlyAppfilterTest {
                         } finally { image.recycle() }
                     }
                 }
-            } finally { zip.delete() }
+                val palette = ThemeColors.Palette(0xFF272B2D.toInt(), 0x66FFFFFF, false)
+                val originalFilter = File(output, "res/xml/appfilter.xml").readText()
+                fun manifestVersion(): Pair<Int, String> =
+                    File(output, "AndroidManifest.xml").reader().use { reader ->
+                        val parser = Xml.newPullParser().apply { setInput(reader) }
+                        while (parser.next() != XmlPullParser.START_TAG) Unit
+                        val namespace = "http://schemas.android.com/apk/res/android"
+                        parser.getAttributeValue(namespace, "versionCode").toInt() to
+                            parser.getAttributeValue(namespace, "versionName")
+                    }
+                val firstVersion = manifestVersion()
+                IconPackAssembler.prepareResources(context, output, entries.reversed(), palette)
+                assertEquals("Input order must not change appfilter metadata", originalFilter,
+                    File(output, "res/xml/appfilter.xml").readText())
+                val secondVersion = manifestVersion()
+                assertTrue("Rapid rebuilds must advance manifest version", secondVersion.first > firstVersion.first)
+                assertEquals("One manifest snapshot must supply both version attributes",
+                    secondVersion.first.toString(), secondVersion.second)
+                IconPackAssembler.prepareResources(context, output, entries.drop(1), palette)
+                val removedName = IconPackAssembler.packDrawableName(entries.first().componentName)
+                assertTrue("Removed day resource must not remain in reused directory",
+                    !File(output, "res/drawable/$removedName.png").exists())
+                assertTrue("Removed night resource must not remain in reused directory",
+                    !File(output, "res/drawable-night/$removedName.png").exists())
+            } finally { entries.forEach { it.lightPng.delete(); it.darkPng.delete() } }
         } finally {
             glyphs.forEach { it.recycle() }
             output.deleteRecursively()

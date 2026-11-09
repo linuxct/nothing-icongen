@@ -116,7 +116,7 @@ class LauncherOnlyConsumerTest {
     }
 
     private fun installedPack(context: Context): InstalledPack {
-        // This must be the currently installed, compiled resource, not assembleZip's source XML.
+        // Read the currently installed, compiled resource, not the prepared source XML.
         val resources = context.packageManager.getResourcesForApplication(PACK_PACKAGE)
         val appfilterId = resources.getIdentifier("appfilter", "xml", PACK_PACKAGE)
         assertTrue("Install a freshly generated $PACK_PACKAGE before running this regression", appfilterId != 0)

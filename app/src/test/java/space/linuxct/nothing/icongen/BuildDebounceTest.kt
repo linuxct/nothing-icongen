@@ -20,7 +20,7 @@ class BuildDebounceTest {
     private val queue get() = context.getSharedPreferences("build_queue", Context.MODE_PRIVATE)
 
     @Before fun setUp() {
-        for (name in listOf("build_queue", "install_state", "auto_update", "onboarding")) {
+        for (name in listOf("build_queue", "icon_preparation", "package_monitor", "install_state", "auto_update", "onboarding")) {
             context.getSharedPreferences(name, Context.MODE_PRIVATE).edit().clear().commit()
         }
         OnboardingState.markComplete(context)
@@ -117,6 +117,24 @@ class BuildDebounceTest {
         assertNull(scheduler.getPendingJob(BuildCoordinator.JOB_ID))
         assertNull(scheduler.getPendingJob(BuildCoordinator.SETTLE_JOB_ID))
         assertEquals(BuildCoordinator.Phase.COMPILING, BuildCoordinator.state.phase)
+        assertEquals(0L, queue.getLong("completed", 0))
+    }
+
+    @Test fun timerReleasesFinalBuildWithoutAcknowledgingOrReplacingWarmJob() {
+        PackageChangeMonitor.reconcileSnapshot(context, emptyMap())
+        PackageChangeMonitor.reconcileSnapshot(context, mapOf("0:example.app" to "1:1000"))
+        val dirty = DirtyIconQueue.snapshot(context)
+        val warm = scheduler.getPendingJob(BuildCoordinator.WARM_JOB_ID)
+        assertNotNull(warm)
+        assertEquals(0L, warm!!.minLatencyMillis)
+        assertNull(scheduler.getPendingJob(BuildCoordinator.JOB_ID))
+        queue.edit().putLong("defer_until", System.currentTimeMillis() - 1).commit()
+
+        BuildCoordinator.settled(context)
+
+        assertNotNull(scheduler.getPendingJob(BuildCoordinator.JOB_ID))
+        assertNotNull(scheduler.getPendingJob(BuildCoordinator.WARM_JOB_ID))
+        assertEquals(dirty, DirtyIconQueue.snapshot(context))
         assertEquals(0L, queue.getLong("completed", 0))
     }
 }

@@ -13,32 +13,43 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
-import java.util.zip.ZipFile
 
-/** ZIP and configuration-dependent palette integration checks run on-device. */
+/** Prepared-directory and configuration-dependent palette integration checks run on-device. */
 @RunWith(AndroidJUnit4::class)
 class PackAssemblyTest {
     @Test
-    fun zipMapsEveryComponentAndUsesRealDayNightTokensAndNativeMaskPolarity() {
+    fun directoryMapsEveryComponentAndPreservesRealDayNightTokensAndNativeMaskPolarity() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val launcher = NativeLauncherOracle.requireLauncher(context)
         val normal = mask(90f)
         val light = mask(282f)
         val glyphs = LauncherGlyphs(normal, light)
-        val entries = listOf(
-            IconPackAssembler.PackEntry("com.example.reference/com.example.reference.First", "First", glyphs),
-            IconPackAssembler.PackEntry("com.example.reference/com.example.reference.Second", "Second", glyphs),
-        )
         val root = File(context.cacheDir, "pack_behavior_${System.nanoTime()}").apply { check(mkdirs()) }
+        val lightPng = File(root, "light.png")
+        val darkPng = File(root, "dark.png")
+        PackIconEncoder().use { encoder ->
+            for ((dark, file) in listOf(false to lightPng, true to darkPng)) {
+                val palette = ThemeColors.resolve(context, dark)
+                val artwork = IconArtwork.buildIcon(palette, glyphs.forColor(palette.foreground))
+                try {
+                    val encoded = encoder.encode(artwork)
+                    try { file.outputStream().use { check(encoded.compress(Bitmap.CompressFormat.PNG, 100, it)) } }
+                    finally { encoded.recycle() }
+                } finally { artwork.recycle() }
+            }
+        }
+        val entries = listOf(
+            IconPackAssembler.PackEntry("com.example.reference/com.example.reference.First", "First", lightPng, darkPng),
+            IconPackAssembler.PackEntry("com.example.reference/com.example.reference.Second", "Second", lightPng, darkPng),
+        )
         val host = NativePackRasterizer(context, IconArtwork.ICON_SIZE)
         try {
-            // Deliberately wrong supplied colors catch assembler reuse/copy(isDark) bugs.
+            // The assembler must use prepared artwork verbatim, not recolor it from this palette.
             val supplied = ThemeColors.Palette(Color.MAGENTA, Color.GREEN, true)
-            val file = IconPackAssembler.assembleZip(context, File(root, "resources"), entries, supplied)
-            ZipFile(file).use { zip ->
-                assertTrue("missing manifest", zip.getEntry("AndroidManifest.xml") != null)
-                val appfilter = requireNotNull(zip.getEntry("res/xml/appfilter.xml"))
-                val xml = zip.getInputStream(appfilter).bufferedReader().use { it.readText() }
+            val resources = IconPackAssembler.prepareResources(context, File(root, "resources"), entries, supplied)
+            run {
+                assertTrue("missing manifest", File(resources, "AndroidManifest.xml").isFile)
+                val xml = File(resources, "res/xml/appfilter.xml").readText()
                 val parser = android.util.Xml.newPullParser().apply { setInput(xml.reader()) }
                 val packageDefaults = linkedMapOf<String, String>()
                 val mappings = linkedMapOf<String, String>()
@@ -76,8 +87,9 @@ class PackAssemblyTest {
                     for (dark in listOf(false, true)) {
                         val palette = ThemeColors.resolve(context, dark)
                         val path = "res/${if (dark) "drawable-night" else "drawable"}/$drawable.png"
-                        val zipped = requireNotNull(zip.getEntry(path)) { "missing $path" }
-                        val bitmap = zip.getInputStream(zipped).use { requireNotNull(BitmapFactory.decodeStream(it)) }
+                        val prepared = File(resources, path)
+                        assertTrue("missing $path", prepared.isFile)
+                        val bitmap = requireNotNull(BitmapFactory.decodeFile(prepared.path))
                         val displayed = host.render(bitmap)
                         try {
                             assertEquals(IconArtwork.ICON_SIZE, bitmap.width)
@@ -104,7 +116,8 @@ class PackAssemblyTest {
                         } finally { bitmap.recycle(); displayed.recycle() }
                     }
                 }
-                val names = zip.entries().asSequence().map { it.name }.toSet()
+                val names = resources.walkTopDown().filter { it.isFile }
+                    .map { it.relativeTo(resources).invariantSeparatorsPath }.toSet()
                 val day = names.filter { it.startsWith("res/drawable/") && it.endsWith(".png") }.map { it.substringAfterLast('/') }.toSet()
                 val night = names.filter { it.startsWith("res/drawable-night/") && it.endsWith(".png") }.map { it.substringAfterLast('/') }.toSet()
                 assertEquals("day/night resource sets", day, night)

@@ -57,9 +57,8 @@ object IconPackBuildService {
         val outputRoot = context.getExternalFilesDir(null) ?: context.filesDir
         val outputDir = File(outputRoot, "$BUILD_DIR_PREFIX${System.currentTimeMillis()}")
         try {
-            // The resource ZIP is written beside outputDir, so it survives the cleanup below.
             val renderFailures = ArrayList<Pair<String, Exception>>()
-            val zip = try {
+            val resources = try {
                 IconGeneratorEngine.generate(
                     context = context.applicationContext,
                     outputDir = outputDir,
@@ -75,7 +74,7 @@ object IconPackBuildService {
                 it.copy(phase = BuildCoordinator.Phase.COMPILING, message = "Compiling APK", percent = 80)
             }
             cancellation.checkpoint()
-            return IconPackAssembler.compileApk(context.applicationContext, zip, cancellation)
+            return IconPackAssembler.compileApk(context.applicationContext, resources, cancellation)
         } finally {
             outputDir.deleteRecursively()
             BuildCoordinator.removeListener(observer)
@@ -90,7 +89,9 @@ object IconPackBuildService {
     fun deleteStaleBuildFolders(context: Context) {
         // Older builds fell back to filesDir when external storage was missing, so sweep both roots.
         listOfNotNull(context.getExternalFilesDir(null), context.filesDir).forEach { root ->
-            root.listFiles { file -> file.name.startsWith(BUILD_DIR_PREFIX) }?.forEach { it.deleteRecursively() }
+            root.listFiles { file ->
+                file.name.startsWith(BUILD_DIR_PREFIX) || file.name.startsWith(".$BUILD_DIR_PREFIX")
+            }?.forEach { it.deleteRecursively() }
         }
         context.cacheDir.listFiles { file -> file.name.startsWith(IconPackAssembler.COMPILE_DIR_PREFIX) }
             ?.forEach { it.deleteRecursively() }

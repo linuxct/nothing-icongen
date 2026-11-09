@@ -57,6 +57,10 @@ The automation switches control app updates, theme changes, and optional notific
 
 Automatic pack updates wait 5 seconds for app installs/updates to settle. Another app change during that wait or generation restarts a 30-second quiet period. Pending waits recover after an app restart or reboot using the remaining delay. Manual generation starts immediately, but a later app update can supersede it before installation begins. Incoming app updates do not cancel an installation that has already started.
 
+Rebuilds reuse cached, post-processed day/night PNGs and compiled resources. Changed apps' icons are prepared during the quiet period, then IconGen builds a complete pack from the current app inventory. Source-app or rendering-configuration changes invalidate the relevant cache entries. If Android clears the cache, the next rebuild regenerates it.
+
+Uninstalled apps' cached icons are swept by a separate daily job, scheduled 24 hours after the previous successful cleanup, independently of automatic pack updates. Its deadline survives restarts; interrupted or failed cleanup stays overdue. Android can defer execution during Doze or force-stop; reopen IconGen after force-stop. Pack generation also removes stale entries.
+
 Theme changes detected while the screen is off or the phone is locked stay pending until wake/unlock. This includes Battery Saver and Bedtime mode: refreshing Nothing Launcher's selector while it sleeps can leave icons using the previous theme. IconGen reapplies the pack after unlock without rebuilding it.
 
 Applying updated icons and theme refresh need Settings access. Choose PC or wireless setup.

@@ -3,33 +3,30 @@ package space.linuxct.nothing.icongen
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
-import android.os.ParcelFileDescriptor
-import android.content.pm.PackageInstaller
-import android.app.PendingIntent
-import android.content.Intent
-import android.net.Uri
+import android.os.SystemClock
 import android.util.Log
 import java.io.File
-import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.util.zip.ZipEntry
 import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeUnit
-import java.util.zip.ZipFile
-import java.util.zip.ZipOutputStream
 
 object IconPackAssembler {
 
     private const val TAG = "IconPackAssembler"
-    /**
-     * Derived from the build timestamp so every regenerated pack is a strictly higher
-     * versionCode. A constant here was why re-installing never replaced the old icons.
-     */
-    private val MANIFEST_CODE: Int
-        get() = (System.currentTimeMillis() / 1000L % 2_000_000_000L).toInt()
+    internal data class PackVersion(val code: Int, val name: String)
 
-    private val MANIFEST_VERSION: String
-        get() = (MANIFEST_CODE / 1000L).toString()
+    /** Persist before use: failed/cancelled builds may leave gaps, never duplicate versions. */
+    @Synchronized
+    internal fun reserveVersion(context: Context, nowMillis: Long = System.currentTimeMillis()): PackVersion {
+        val preferences = context.getSharedPreferences("iconpack_versions", Context.MODE_PRIVATE)
+        val installed = try {
+            context.packageManager.getPackageInfo(PACKAGE_NAME, 0).longVersionCode
+        } catch (_: android.content.pm.PackageManager.NameNotFoundException) { 0L }
+        val next = maxOf(nowMillis / 1000L, preferences.getLong("last_code", 0) + 1L, installed + 1L)
+        check(next in 1..Int.MAX_VALUE.toLong()) { "Icon pack version code exhausted" }
+        check(preferences.edit().putLong("last_code", next).commit()) { "Cannot persist icon pack version" }
+        return PackVersion(next.toInt(), next.toString())
+    }
     private const val MIN_SDK = 33
     private const val TARGET_SDK = 37
     internal const val PACKAGE_NAME = "com.nothing.icongen.pack"
@@ -38,161 +35,119 @@ object IconPackAssembler {
     data class PackEntry(
         val componentName: String,
         val label: String,
-        /** Native normal/light alpha masks, retained until both resource variants are written. */
-        val glyphs: LauncherGlyphs,
+        val lightPng: File,
+        val darkPng: File,
     )
 
-    fun assembleZip(
+    @Synchronized
+    fun prepareResources(
         context: Context,
         outputDir: File,
         entries: List<PackEntry>,
         palette: ThemeColors.Palette,
         cancellation: BuildCoordinator.Cancellation = BuildCoordinator.cancellation(context),
     ): File {
-        Log.d(TAG, "Assembling icon pack resources for ${entries.size} apps")
+        val started = SystemClock.elapsedRealtime()
         cancellation.checkpoint()
-
-        outputDir.mkdirs()
-
+        val ordered = entries.sortedBy { it.componentName }
+        require(ordered.map { it.componentName }.distinct().size == ordered.size) { "Duplicate launcher component" }
+        require(ordered.map { packDrawableName(it.componentName) }.distinct().size == ordered.size) { "Colliding drawable names" }
+        outputDir.parentFile?.mkdirs()
+        val staged = File(outputDir.parentFile, ".${outputDir.name}_${System.nanoTime()}").apply { check(mkdirs()) }
+        val previous = File(outputDir.parentFile, ".${outputDir.name}_previous_${System.nanoTime()}")
         try {
-            generateManifest(context, outputDir, palette)
-            generateAppfilter(context, outputDir, entries)
-            generateResources(context, outputDir, entries, palette, cancellation)
-            generateResourceFiles(context, outputDir, entries)
+            generateManifest(staged, reserveVersion(context))
+            generateAppfilter(staged, ordered)
+            generateResources(context, staged, ordered, cancellation)
+            generateResourceFiles(context, staged)
             cancellation.checkpoint()
-
-            val zipFile = File(outputDir.parentFile, "iconpack_resources.zip")
-            zipFile.delete()
-
-            ZipOutputStream(FileOutputStream(zipFile)).use { zout ->
-                zipDir(zout, outputDir, outputDir, cancellation)
+            if (outputDir.exists()) check(outputDir.renameTo(previous)) { "Cannot move previous resource inventory" }
+            if (!staged.renameTo(outputDir)) {
+                previous.renameTo(outputDir)
+                error("Cannot publish resource inventory")
             }
-
-            Log.d(TAG, "Icon pack resources ZIP created at ${zipFile.absolutePath} (${zipFile.length()} bytes)")
-            return zipFile
+            Log.d(TAG, "Prepared resources: entries=${ordered.size} ms=${SystemClock.elapsedRealtime() - started}")
+            return outputDir
         } catch (e: Exception) {
             if (e is CancellationException) throw e
-            throw RuntimeException("Resource ZIP assembly failed: ${e.message}", e)
+            throw RuntimeException("Resource assembly failed: ${e.message}", e)
+        } finally {
+            staged.deleteRecursively()
+            previous.deleteRecursively()
         }
     }
 
-    private fun zipDir(zout: ZipOutputStream, baseDir: File, dir: File, cancellation: BuildCoordinator.Cancellation) {
-        dir.listFiles()?.forEach { file ->
-            cancellation.checkpoint()
-            val entryPath = file.relativeTo(baseDir).path
-            if (file.isDirectory) {
-                zout.putNextEntry(ZipEntry(entryPath + "/"))
-                zout.closeEntry()
-                zipDir(zout, baseDir, file, cancellation)
-            } else {
-                zout.putNextEntry(ZipEntry(entryPath))
-                FileInputStream(file).use { fin ->
-                    fin.copyTo(zout)
-                }
-                zout.closeEntry()
-            }
-        }
-    }
-
-    fun assemble(
+    /** One serialized owner protects cache entries through link/sign and atomic APK publication. */
+    @Synchronized
+    fun compileApk(
         context: Context,
-        entries: List<PackEntry>,
-        palette: ThemeColors.Palette,
+        resourceDir: File,
+        cancellation: BuildCoordinator.Cancellation = BuildCoordinator.cancellation(context),
     ): File {
-        Log.d(TAG, "Assembling icon pack (ZIP output) for ${entries.size} apps")
-        val outputDir = File(context.cacheDir, "iconpack_${System.currentTimeMillis()}")
-        return assembleZip(context, outputDir, entries, palette)
-    }
-
-    fun compileApk(context: Context, zipFile: File,
-                   cancellation: BuildCoordinator.Cancellation = BuildCoordinator.cancellation(context)): File {
         cancellation.checkpoint()
-        Log.d(TAG, "Compiling APK from ZIP: ${zipFile.absolutePath}")
-
-        val outputDir = File(context.cacheDir, "$COMPILE_DIR_PREFIX${System.currentTimeMillis()}")
+        val outputDir = File(context.cacheDir, "$COMPILE_DIR_PREFIX${System.nanoTime()}").apply { check(mkdirs()) }
+        val cache = AaptResourceCache(File(context.cacheDir, "aapt2_flat_v1"))
         try {
-            return compileApkIn(outputDir, context, zipFile, cancellation)
+            App.instance.ensureTools()
+            cancellation.checkpoint()
+            val manifest = File(resourceDir, "AndroidManifest.xml")
+            check(manifest.isFile) { "AndroidManifest.xml missing from prepared resources at ${manifest.absolutePath}" }
+            val resources = File(resourceDir, "res")
+            check(resources.isDirectory) { "Prepared resource directory missing at ${resources.absolutePath}" }
+            val compiled = try {
+                cache.compile(resources, File(App.instance.aapt2Path), outputDir, cancellation) {
+                    runCommand(cancellation, *it.toTypedArray())
+                }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                throw RuntimeException("aapt2 compile failed: ${e.message}", e)
+            }
+            val active = compiled.files
+            // A response file keeps full inventories below Android's process argument limit.
+            val inventory = File(outputDir, "resources.list")
+            inventory.bufferedWriter().use { writer ->
+                for (flat in active) {
+                    // AAPT2 treats quotes literally here; these app-private hash paths contain no whitespace.
+                    writer.append(flat.absolutePath).append('\n')
+                }
+            }
+            val apk = File(outputDir, "iconpack.apk")
+            val linkStarted = SystemClock.elapsedRealtime()
+            try {
+                runCommand(cancellation, App.instance.aapt2Path, "link",
+                    "-o", apk.absolutePath, "-I", App.instance.androidJarPath,
+                    "--manifest", manifest.absolutePath,
+                    "--target-sdk-version", TARGET_SDK.toString(), "@${inventory.absolutePath}")
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                throw RuntimeException("aapt2 link failed: ${e.message}", e)
+            }
+            Log.d(TAG, "AAPT2 link: resources=${active.size} ms=${SystemClock.elapsedRealtime() - linkStarted}")
+            cancellation.checkpoint()
+            val signStarted = SystemClock.elapsedRealtime()
+            ApkSignerTool.signApk(context, apk)
+            cancellation.checkpoint()
+            // filesDir/cacheDir can be separate filesystems: stage beside the final APK.
+            val published = File(context.filesDir, "iconpack.apk")
+            val stagingApk = File(context.filesDir, ".iconpack_${System.nanoTime()}.apk")
+            try {
+                try {
+                    android.system.Os.link(apk.absolutePath, stagingApk.absolutePath)
+                } catch (_: android.system.ErrnoException) {
+                    apk.copyTo(stagingApk)
+                }
+                cancellation.checkpoint()
+                check(stagingApk.renameTo(published)) { "Cannot publish signed icon pack" }
+            } finally { stagingApk.delete() }
+            Log.d(TAG, "APK signed: bytes=${published.length()} ms=${SystemClock.elapsedRealtime() - signStarted}")
+            return published
         } finally {
             outputDir.deleteRecursively()
+            cache.evict(emptyList())
         }
     }
 
-    private fun compileApkIn(outputDir: File, context: Context, zipFile: File,
-                             cancellation: BuildCoordinator.Cancellation): File {
-        outputDir.mkdirs()
-        val resDir = File(outputDir, "res")
-        resDir.mkdirs()
-
-        // Unzip resources
-        try {
-            ZipFile(zipFile).use { zip ->
-                zip.entries().asSequence().forEach { entry ->
-                    cancellation.checkpoint()
-                    val outFile = File(outputDir, entry.name)
-                    if (entry.isDirectory) {
-                        outFile.mkdirs()
-                    } else {
-                        outFile.parentFile?.mkdirs()
-                        zip.getInputStream(entry).use { input ->
-                            FileOutputStream(outFile).use { output ->
-                                input.copyTo(output)
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            if (e is CancellationException) throw e
-            throw RuntimeException("Failed to unzip resources: ${e.message}", e)
-        }
-
-        // Toolchain: executables in nativeLibraryDir (app-private, executable), android.jar in filesDir.
-        App.instance.ensureTools()
-        cancellation.checkpoint()
-        val aapt2Path = App.instance.aapt2Path
-        val androidJarPath = App.instance.androidJarPath
-
-        val manifestFile = File(outputDir, "AndroidManifest.xml")
-        if (!manifestFile.exists()) {
-            throw RuntimeException("AndroidManifest.xml missing from resource ZIP at ${manifestFile.absolutePath}")
-        }
-
-        val compiledRes = File(outputDir, "resources.zip")
-        val apkFile = File(context.filesDir, "iconpack.apk")
-
-        // Compile resources: aapt2 compile res -o resources.zip --dir res
-        try {
-            runCommand(cancellation, aapt2Path, "compile", "-o", compiledRes.absolutePath, "--dir", resDir.absolutePath)
-        } catch (e: Exception) {
-            if (e is CancellationException) throw e
-            throw RuntimeException("aapt2 compile failed: ${e.message}", e)
-        }
-
-        // Link APK: aapt2 link -o apk -I android.jar --manifest
-        try {
-            runCommand(
-                cancellation, aapt2Path, "link",
-                "-o", apkFile.absolutePath,
-                "-I", androidJarPath,
-                "--manifest", manifestFile.absolutePath,
-                "--target-sdk-version", "37",
-                compiledRes.absolutePath
-            )
-        } catch (e: Exception) {
-            if (e is CancellationException) throw e
-            throw RuntimeException("aapt2 link failed: ${e.message}", e)
-        }
-
-        // Every install must be signed; reuse the persistent on-device key so upgrades work.
-        cancellation.checkpoint()
-        ApkSignerTool.signApk(context, apkFile)
-        cancellation.checkpoint()
-
-        Log.d(TAG, "APK compiled and signed: ${apkFile.absolutePath} (${apkFile.length()} bytes)")
-        return apkFile
-    }
-
-    private fun runCommand(cancellation: BuildCoordinator.Cancellation, vararg args: String) {
+    internal fun runCommand(cancellation: BuildCoordinator.Cancellation, vararg args: String) {
         cancellation.checkpoint()
         val outputFile = File.createTempFile("aapt2_", ".log", App.instance.cacheDir)
         try {
@@ -219,16 +174,14 @@ object IconPackAssembler {
         }
     }
 
-    private fun generateManifest(context: Context, outputDir: File, palette: ThemeColors.Palette) {
+    private fun generateManifest(outputDir: File, version: PackVersion) {
         val manifestFile = File(outputDir, "AndroidManifest.xml")
-        val resDir = File(outputDir, "res")
-        resDir.mkdirs()
 
         val manifestXml = """<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="$PACKAGE_NAME"
-    android:versionCode="$MANIFEST_CODE"
-    android:versionName="$MANIFEST_VERSION">
+    android:versionCode="${version.code}"
+    android:versionName="${version.name}">
 
     <uses-sdk android:minSdkVersion="$MIN_SDK" android:targetSdkVersion="$TARGET_SDK" />
 
@@ -266,7 +219,6 @@ object IconPackAssembler {
     }
 
     private fun generateAppfilter(
-        context: Context,
         outputDir: File,
         entries: List<PackEntry>,
     ) {
@@ -300,66 +252,74 @@ object IconPackAssembler {
     }
 
     /** Must match the drawable names written into appfilter.xml and the produced PNGs. */
-    private fun packDrawableName(componentName: String): String =
-        "icon_" + componentName.lowercase().replace(Regex("[^a-z0-9]"), "_")
+    internal fun packDrawableName(componentName: String): String =
+        "icon_" + componentName.lowercase(java.util.Locale.ROOT).replace(Regex("[^a-z0-9]"), "_")
 
     private fun generateResources(
         context: Context,
         outputDir: File,
         entries: List<PackEntry>,
-        palette: ThemeColors.Palette,
         cancellation: BuildCoordinator.Cancellation,
     ) {
-        // Qualifiers select the right variant on a fresh drawable lookup. The launcher
-        // caches rasterized icons, so a uiMode change alone does not guarantee a refresh.
-        val drawableDir = File(outputDir, "res/drawable")
-        val drawableNightDir = File(outputDir, "res/drawable-night")
-        drawableDir.mkdirs()
-        drawableNightDir.mkdirs()
-
-        val mipmapDir = File(outputDir, "res/mipmap-nodpi")
-        mipmapDir.mkdirs()
-        val launcherIcon = Bitmap.createBitmap(IconArtwork.ICON_SIZE, IconArtwork.ICON_SIZE, Bitmap.Config.ARGB_8888)
-        try {
-            val artwork = requireNotNull(context.getDrawable(R.drawable.ic_icon_pack))
-            artwork.setBounds(0, 0, launcherIcon.width, launcherIcon.height)
-            artwork.draw(Canvas(launcherIcon))
-            saveBitmapAsPng(launcherIcon, File(mipmapDir, "ic_launcher.png"))
-        } finally { launcherIcon.recycle() }
-
-        // Resolve each configuration independently; copying isDark would retain the wrong ink.
+        val drawableDir = File(outputDir, "res/drawable").apply { mkdirs() }
+        val drawableNightDir = File(outputDir, "res/drawable-night").apply { mkdirs() }
+        val artworkCache = File(context.cacheDir, "pack_artwork_v1").apply { mkdirs() }
+        artworkCache.listFiles { file -> file.name.startsWith('.') }?.forEach { it.delete() }
         val lightPalette = ThemeColors.resolve(context, dark = false)
         val darkPalette = ThemeColors.resolve(context, dark = true)
+        val appRevision = context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime
 
-        PackIconEncoder().use { encoder ->
-            fun saveForLauncher(artwork: Bitmap, file: File) {
+        fun cachedArtwork(key: String, destination: File, create: () -> Bitmap) {
+            cancellation.checkpoint()
+            val id = AaptResourceCache.digest(key.toByteArray())
+            val source = File(artworkCache, "$id.png")
+            val checksum = File(artworkCache, "$id.sha256")
+            val valid = try {
+                source.isFile && checksum.readText() == AaptResourceCache.digest(source)
+            } catch (_: java.io.IOException) { false }
+            if (!valid) {
+                val temporary = File(artworkCache, ".$id.${System.nanoTime()}")
+                val bitmap = create()
                 try {
-                    val encoded = encoder.encode(artwork)
-                    try { saveBitmapAsPng(encoded, file) } finally { encoded.recycle() }
-                } finally { artwork.recycle() }
+                    saveBitmapAsPng(bitmap, temporary)
+                    check(temporary.renameTo(source)) { "Cannot publish cached artwork" }
+                    checksum.writeText(AaptResourceCache.digest(source))
+                } finally { bitmap.recycle(); temporary.delete() }
             }
-            saveForLauncher(IconArtwork.buildPlate(lightPalette), File(drawableDir, "icon_background.png"))
-            saveForLauncher(IconArtwork.buildPlate(darkPalette), File(drawableNightDir, "icon_background.png"))
+            source.setLastModified(System.currentTimeMillis())
+            reusePng(source, destination)
+        }
 
-            for (entry in entries) {
-                cancellation.checkpoint()
-                // Native artwork stays unchanged as the target. Encode the complete RGBA
-                // composite to counter the host's source/shadows/source rasterization.
-                val name = "${packDrawableName(entry.componentName)}.png"
-                saveForLauncher(
-                    IconArtwork.buildIcon(lightPalette, entry.glyphs.forColor(lightPalette.foreground)),
-                    File(drawableDir, name),
-                )
-                cancellation.checkpoint()
-                saveForLauncher(
-                    IconArtwork.buildIcon(darkPalette, entry.glyphs.forColor(darkPalette.foreground)),
-                    File(drawableNightDir, name),
-                )
+        cachedArtwork("launcher-v1:$appRevision:${context.resources.configuration}",
+            File(outputDir, "res/mipmap-nodpi/ic_launcher.png")) {
+            Bitmap.createBitmap(IconArtwork.ICON_SIZE, IconArtwork.ICON_SIZE, Bitmap.Config.ARGB_8888).also { bitmap ->
+                val artwork = requireNotNull(context.getDrawable(R.drawable.ic_icon_pack))
+                artwork.setBounds(0, 0, bitmap.width, bitmap.height)
+                artwork.draw(Canvas(bitmap))
             }
         }
+        // Allocate encoder bitmap buffers only on a cache miss.
+        for ((colors, directory) in listOf(lightPalette to drawableDir, darkPalette to drawableNightDir)) {
+            cachedArtwork("plate-v1:$appRevision:${colors.foreground}:${colors.background}:${colors.isDark}",
+                File(directory, "icon_background.png")) {
+                PackIconEncoder().use { encoder ->
+                    val plate = IconArtwork.buildPlate(colors)
+                    try { encoder.encode(plate) } finally { plate.recycle() }
+                }
+            }
+        }
+        for (entry in entries) {
+            cancellation.checkpoint()
+            val name = "${packDrawableName(entry.componentName)}.png"
+            reusePng(entry.lightPng, File(drawableDir, name))
+            reusePng(entry.darkPng, File(drawableNightDir, name))
+        }
+        // The active build now owns links/copies, so old cached artwork can be bounded safely.
+        artworkCache.listFiles { file -> file.extension == "png" }?.sortedByDescending { it.lastModified() }
+            ?.drop(24)?.forEach { it.delete(); File(artworkCache, "${it.nameWithoutExtension}.sha256").delete() }
     }
 
-    private fun generateResourceFiles(context: Context, outputDir: File, entries: List<PackEntry>) {
+    private fun generateResourceFiles(context: Context, outputDir: File) {
         val valuesDir = File(outputDir, "res/values")
         valuesDir.mkdirs()
 
@@ -370,7 +330,7 @@ object IconPackAssembler {
     <string-array name="appfilter">
         <item>@xml/appfilter</item>
     </string-array>
-    <string name="app_label">${context.getString(R.string.icon_pack_name)}</string>
+    <string name="app_label">${xmlEscape(context.getString(R.string.icon_pack_name))}</string>
 </resources>
 """,
         )
@@ -390,12 +350,21 @@ object IconPackAssembler {
     private fun saveBitmapAsPng(bitmap: Bitmap, file: File) {
         file.parentFile?.mkdirs()
         FileOutputStream(file).use { out ->
-            bitmap.compress(Bitmap.CompressFormat.PNG, 90, out)
+            check(bitmap.compress(Bitmap.CompressFormat.PNG, 90, out)) { "PNG encoding failed: $file" }
             out.flush()
         }
     }
 
-    private fun String.ifNegative(transform: (String) -> String): String {
-        return if (startsWith("-")) transform(this.substring(1)) else this
+    private fun reusePng(source: File, destination: File) {
+        check(source.isFile && source.length() > 0) { "Prepared PNG missing: $source" }
+        destination.parentFile?.mkdirs()
+        try {
+            android.system.Os.link(source.absolutePath, destination.absolutePath)
+        } catch (_: android.system.ErrnoException) {
+            source.copyTo(destination)
+        }
     }
+
+    private fun xmlEscape(value: String): String = value.replace("&", "&amp;")
+        .replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&apos;")
 }
