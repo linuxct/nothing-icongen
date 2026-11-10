@@ -7,10 +7,13 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.LauncherApps
+import android.content.pm.LauncherActivityInfo
+import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.os.Process
 import android.os.Handler
 import android.os.Looper
+import android.os.Build
 import android.os.UserManager
 import android.os.UserHandle
 import android.util.Log
@@ -89,10 +92,12 @@ object PackageChangeMonitor {
         val currentUser = Process.myUserHandle()
         val currentProfile = users.getSerialNumberForUser(currentUser)
         @Suppress("DEPRECATION")
-        val installed = context.packageManager.getInstalledPackages(0)
+        val installed = if (Build.VERSION.SDK_INT >= 35) {
+            context.packageManager.getInstalledPackages(PackageManager.PackageInfoFlags.of(PackageManager.MATCH_ARCHIVED_PACKAGES))
+        } else context.packageManager.getInstalledPackages(0)
         for (info in installed) {
             if (excluded(context, info.packageName)) continue
-            records["$currentProfile:${info.packageName}"] = "${info.longVersionCode}:${info.lastUpdateTime}"
+            records["$currentProfile:${info.packageName}"] = packageIdentity(info)
         }
         val launcherApps = context.getSystemService(LauncherApps::class.java)
         val profiles = try { launcherApps.profiles } catch (_: SecurityException) { null }
@@ -108,11 +113,7 @@ object PackageChangeMonitor {
             for (activity in activities) {
                 val packageName = activity.componentName.packageName
                 if (excluded(context, packageName)) continue
-                // The current-user PackageManager can report the wrong profile's version.
-                // The other profile's APK metadata comes from LauncherApps itself instead.
-                val source = File(activity.applicationInfo.sourceDir)
-                records["$profile:$packageName"] =
-                    "${activity.firstInstallTime}:${source.absolutePath}:${source.lastModified()}:${source.length()}"
+                records["$profile:$packageName"] = launcherIdentity(activity)
             }
         }
         return IdentityInventory(records, unavailable, currentProfile, profiles == null)
@@ -140,16 +141,20 @@ object PackageChangeMonitor {
         return try {
             if (user == Process.myUserHandle()) {
                 @Suppress("DEPRECATION")
-                val info = context.packageManager.getPackageInfo(packageName, 0)
-                val source = info.applicationInfo?.sourceDir?.let(::File) ?: return null
-                if (!source.isFile || !source.canRead()) return null
-                "${info.longVersionCode}:${info.lastUpdateTime}"
+                val info = if (Build.VERSION.SDK_INT >= 35) {
+                    context.packageManager.getPackageInfo(packageName,
+                        PackageManager.PackageInfoFlags.of(PackageManager.MATCH_ARCHIVED_PACKAGES))
+                } else context.packageManager.getPackageInfo(packageName, 0)
+                // Archived icons are retained by LauncherApps after Android removes the APK.
+                if (Build.VERSION.SDK_INT < 35 || info.archiveTimeMillis == 0L) {
+                    val source = info.applicationInfo?.sourceDir?.let(::File) ?: return null
+                    if (!source.isFile || !source.canRead()) return null
+                }
+                packageIdentity(info)
             } else {
                 val activity = context.getSystemService(LauncherApps::class.java)
                     .getActivityList(packageName, user).firstOrNull() ?: return null
-                val source = activity.applicationInfo.sourceDir?.let(::File) ?: return null
-                if (!source.isFile || !source.canRead()) return null
-                "${activity.firstInstallTime}:${source.absolutePath}:${source.lastModified()}:${source.length()}"
+                launcherIdentity(activity)
             }
         } catch (_: PackageManager.NameNotFoundException) {
             null
@@ -157,6 +162,26 @@ object PackageChangeMonitor {
             null
         }
     }
+
+    private fun packageIdentity(info: PackageInfo): String {
+        val version = "${info.longVersionCode}:${info.lastUpdateTime}"
+        return if (Build.VERSION.SDK_INT >= 35 && info.archiveTimeMillis > 0L) {
+            "archived:$version:${info.archiveTimeMillis}"
+        } else version
+    }
+
+    private fun launcherIdentity(activity: LauncherActivityInfo): String {
+        val source = activity.applicationInfo.sourceDir?.let(::File)
+        return if (source != null && source.isFile && source.canRead()) {
+            "${activity.firstInstallTime}:${source.absolutePath}:${source.lastModified()}:${source.length()}"
+        } else {
+            // Other profiles expose retained launcher artwork but no public archive timestamp.
+            // Keep it renderable without reusing PNGs whose freshness cannot be established.
+            "launcher-only:${activity.firstInstallTime}:${source?.absolutePath.orEmpty()}"
+        }
+    }
+
+    internal fun isCacheableIdentity(identity: String): Boolean = !identity.startsWith("launcher-only:")
 
     private fun excluded(context: Context, packageName: String) =
         packageName == context.packageName || packageName == PackageChangeReceiver.PACK_PACKAGE

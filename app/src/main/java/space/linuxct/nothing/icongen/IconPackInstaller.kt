@@ -336,8 +336,12 @@ object IconPackInstaller {
             prefs.getString(SNAPSHOT, null)?.let { PackageChangeMonitor.installed(context, it) }
         }
         publish(context)
-        IconPackBuildService.postResult(context, if (verified) "Icon pack updated" else "Icon pack install failed",
-            resultMessage, if (verified) IconPackBuildService.ResultKind.SUCCESS else IconPackBuildService.ResultKind.ERROR)
+        if (verified) {
+            IconPackBuildService.cancelResult(context)
+        } else {
+            IconPackBuildService.postResult(context, "Icon pack install failed",
+                resultMessage, IconPackBuildService.ResultKind.ERROR)
+        }
         BuildCoordinator.resumeQueued(context)
     }
 

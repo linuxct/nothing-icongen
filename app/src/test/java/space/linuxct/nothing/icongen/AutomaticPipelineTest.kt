@@ -190,6 +190,40 @@ class AutomaticPipelineTest {
         assertEquals("build-start-snapshot", prefs("package_monitor").getString("installed_fingerprint", null))
     }
 
+    @Test fun packSuccessIsSilentWhileFailuresAndConfirmationRemainVisible() {
+        val manager = context.getSystemService(android.app.NotificationManager::class.java)
+        prefs("notification_preferences").edit().clear().commit()
+        shadowOf(context as Application).grantPermissions(android.Manifest.permission.POST_NOTIFICATIONS)
+        manager.cancelAll()
+        try {
+            operation()
+            installedPackage(PackageChangeReceiver.PACK_PACKAGE, 43)
+            callback(PackageInstaller.STATUS_SUCCESS)
+            assertEquals(BuildCoordinator.Phase.DONE, BuildCoordinator.state.phase)
+            assertTrue(manager.activeNotifications.none { it.id == 43 })
+            assertEquals("build-start-snapshot", prefs("package_monitor").getString("installed_fingerprint", null))
+
+            operation(session = 72)
+            callback(PackageInstaller.STATUS_FAILURE, session = 72)
+            assertEquals(BuildCoordinator.Phase.FAILED, BuildCoordinator.state.phase)
+            assertTrue(manager.activeNotifications.any { it.id == 43 })
+            IconPackBuildService.postThemeAccessReminder(context, "Settings access needs attention")
+
+            operation(session = 73)
+            callback(PackageInstaller.STATUS_SUCCESS, session = 73)
+            assertEquals(BuildCoordinator.Phase.DONE, BuildCoordinator.state.phase)
+            assertTrue(manager.activeNotifications.none { it.id == 43 })
+            assertTrue("Pack completion must preserve unrelated reminders", manager.activeNotifications.any { it.id == 44 })
+            operation(session = 74)
+            callback(PackageInstaller.STATUS_PENDING_USER_ACTION, session = 74, confirmation = Intent("example.CONFIRM"))
+            assertEquals(BuildCoordinator.Phase.WAITING_CONFIRMATION, BuildCoordinator.state.phase)
+            assertNotNull(manager.activeNotifications.single { it.id == 43 }.notification.contentIntent)
+            callback(PackageInstaller.STATUS_SUCCESS, session = 74)
+            assertEquals(BuildCoordinator.Phase.DONE, BuildCoordinator.state.phase)
+            assertTrue(manager.activeNotifications.none { it.id == 43 })
+        } finally { manager.cancelAll() }
+    }
+
     @Test fun ownSuccessCannotApplyAnOlderInstalledPack() {
         operation()
         installedPackage(PackageChangeReceiver.PACK_PACKAGE, 42)

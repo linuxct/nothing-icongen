@@ -46,7 +46,7 @@ internal class PreparedIconCache(
         if (dark != null) protected.add(dark.parentFile!!)
         if (light == null || dark == null) {
             val drawable = app.icon
-            val reusable = drawable !is Animatable
+            val reusable = drawable !is Animatable && PackageChangeMonitor.isCacheableIdentity(app.sourceIdentity)
             try {
                 val glyphs = pipeline.glyph(drawable)
                 rendered++

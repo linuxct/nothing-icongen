@@ -194,6 +194,10 @@ object IconPackBuildService {
         context.getSystemService(NotificationManager::class.java).cancel(THEME_ACCESS_ID)
     }
 
+    internal fun cancelResult(context: Context) = synchronized(NotificationPreferences) {
+        context.getSystemService(NotificationManager::class.java).cancel(RESULT_ID)
+    }
+
     fun postThemeAccessReminder(context: Context, failure: String) = synchronized(ThemeRefreshController) {
         if (!OnboardingState.isComplete(context) || !ThemeRefreshController.isEnabled(context)) return@synchronized
         val action = PendingIntent.getActivity(
