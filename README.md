@@ -1,4 +1,4 @@
-# Nothing IconGen: Translucent Icon Generator
+# Nothing IconGen: Translucent Icon Generator ![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/linuxct/nothing-icongen/total?style=for-the-badge)
 
 Create and install Nothing OS 5.0-style translucent icons on your phone. Making your apps a bit more Lucent!
 
