@@ -215,12 +215,18 @@ class AutomaticPipelineTest {
             assertTrue(manager.activeNotifications.none { it.id == 43 })
             assertTrue("Pack completion must preserve unrelated reminders", manager.activeNotifications.any { it.id == 44 })
             operation(session = 74)
+            NotificationPreferences.setEnabled(context, false)
             callback(PackageInstaller.STATUS_PENDING_USER_ACTION, session = 74, confirmation = Intent("example.CONFIRM"))
             assertEquals(BuildCoordinator.Phase.WAITING_CONFIRMATION, BuildCoordinator.state.phase)
-            assertNotNull(manager.activeNotifications.single { it.id == 43 }.notification.contentIntent)
+            val approval = manager.activeNotifications.single { it.id == IconPackBuildService.INSTALL_CONFIRMATION_ID }.notification
+            assertEquals(0L, approval.timeoutAfter)
+            assertEquals("example.CONFIRM", shadowOf(approval.contentIntent).savedIntent.action)
+            NotificationPreferences.setEnabled(context, false)
+            assertTrue(manager.activeNotifications.any { it.id == IconPackBuildService.INSTALL_CONFIRMATION_ID })
             callback(PackageInstaller.STATUS_SUCCESS, session = 74)
             assertEquals(BuildCoordinator.Phase.DONE, BuildCoordinator.state.phase)
             assertTrue(manager.activeNotifications.none { it.id == 43 })
+            assertTrue(manager.activeNotifications.none { it.id == IconPackBuildService.INSTALL_CONFIRMATION_ID })
         } finally { manager.cancelAll() }
     }
 

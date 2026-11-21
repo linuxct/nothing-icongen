@@ -20,10 +20,12 @@ object IconPackBuildService {
     private const val TAG = "IconPackBuildService"
     private const val CHANNEL = "iconpack_updates_silent"
     private const val CHANNEL_DONE = "iconpack_results_silent"
+    private const val CONFIRMATION_CHANNEL = "iconpack_install_approval"
     private const val NOTIFICATION_ID = 42
     private const val RESULT_ID = 43
     private const val THEME_ACCESS_ID = 44
     private const val RENDER_ERRORS_ID = 45
+    internal const val INSTALL_CONFIRMATION_ID = 46
     private const val NOTIFICATION_TIMEOUT_MS = 60_000L
     private const val BUILD_DIR_PREFIX = "autobuild_"
     private const val PROGRESS_THROTTLE_MS = 500L
@@ -198,6 +200,29 @@ object IconPackBuildService {
         context.getSystemService(NotificationManager::class.java).cancel(RESULT_ID)
     }
 
+    internal fun cancelInstallConfirmation(context: Context) {
+        context.getSystemService(NotificationManager::class.java).cancel(INSTALL_CONFIRMATION_ID)
+    }
+
+    internal fun postInstallConfirmation(context: Context, action: PendingIntent) {
+        val manager = context.getSystemService(NotificationManager::class.java)
+        if (!canPostNotifications(context)) return
+        manager.cancel(RESULT_ID)
+        manager.createNotificationChannel(NotificationChannel(
+            CONFIRMATION_CHANNEL, "Icon pack installation approval", NotificationManager.IMPORTANCE_DEFAULT,
+        ).apply { setShowBadge(false) })
+        // This is required to finish the pending install, not an optional progress/result notice.
+        manager.notify(INSTALL_CONFIRMATION_ID, Notification.Builder(context, CONFIRMATION_CHANNEL)
+            .setSmallIcon(R.drawable.ic_notification_waiting)
+            .setContentTitle("Approve icon pack update")
+            .setContentText("Tap to open Android’s installer and approve the update.")
+            .setContentIntent(action)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(false)
+            .setVisibility(Notification.VISIBILITY_PRIVATE)
+            .build())
+    }
+
     fun postThemeAccessReminder(context: Context, failure: String) = synchronized(ThemeRefreshController) {
         if (!OnboardingState.isComplete(context) || !ThemeRefreshController.isEnabled(context)) return@synchronized
         val action = PendingIntent.getActivity(
@@ -274,8 +299,10 @@ object IconPackBuildService {
     }
 
     private fun canNotify(context: Context): Boolean =
-        NotificationPreferences.isEnabled(context) &&
-            context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED &&
+        NotificationPreferences.isEnabled(context) && canPostNotifications(context)
+
+    private fun canPostNotifications(context: Context): Boolean =
+        context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED &&
             context.getSystemService(NotificationManager::class.java).areNotificationsEnabled()
 
     fun ensureChannels(context: Context) {

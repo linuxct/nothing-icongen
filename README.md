@@ -53,9 +53,9 @@ Shizuku's wireless-start service must be started again after a reboot before usi
 
 After updating IconGen, update the pack once. Generated artwork is mapped to launcher activities; package-level system icons keep their original artwork.
 
-The automation switches control app updates, theme changes, and optional notifications. App updates rebuild, install, and apply the pack. Theme changes refresh it without rebuilding.
+The automation switches control app updates, theme changes, and optional notifications. App updates rebuild, install, and apply the pack; if approval is required, its notification opens Android’s installer directly. Theme changes refresh the pack without rebuilding.
 
-Automatic pack updates wait 5 seconds for app installs/updates to settle. Another app change during that wait or generation restarts a 30-second quiet period. Pending waits recover after an app restart or reboot using the remaining delay. Manual generation starts immediately, but a later app update can supersede it before installation begins. Incoming app updates do not cancel an installation that has already started.
+Automatic pack updates wait 5 seconds for app changes to settle, or 30 seconds during a burst. Manual generation skips the quiet period, but both wait out Android’s silent-install cooldown after a successful pack update. Pending work recovers after restart. New app updates can supersede generation, not an installation already in progress.
 
 Rebuilds reuse cached, post-processed day/night PNGs and compiled resources. Changed apps' icons are prepared during the quiet period, then IconGen builds a complete pack from the current app inventory. Source-app or rendering-configuration changes invalidate the relevant cache entries. If Android clears the cache, the next rebuild regenerates it.
 

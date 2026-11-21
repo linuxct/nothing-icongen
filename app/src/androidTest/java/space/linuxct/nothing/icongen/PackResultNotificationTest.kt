@@ -29,10 +29,10 @@ class PackResultNotificationTest {
         assumeTrue("Notifications are blocked by the device", manager.areNotificationsEnabled())
         assumeTrue("Result channel is blocked by the user",
             manager.getNotificationChannel("iconpack_results_silent")?.importance != NotificationManager.IMPORTANCE_NONE)
-        fun awaitIcon(icon: Int): android.app.Notification {
+        fun awaitIcon(icon: Int, id: Int = 43): android.app.Notification {
             val deadline = android.os.SystemClock.uptimeMillis() + 5_000
             while (true) {
-                manager.activeNotifications.firstOrNull { it.id == 43 && it.notification.smallIcon.resId == icon }
+                manager.activeNotifications.firstOrNull { it.id == id && it.notification.smallIcon.resId == icon }
                     ?.let { return it.notification }
                 check(android.os.SystemClock.uptimeMillis() < deadline) { "Android did not publish result icon $icon" }
                 android.os.SystemClock.sleep(25)
@@ -55,10 +55,13 @@ class PackResultNotificationTest {
         }
         fun awaitCleared() {
             val deadline = android.os.SystemClock.uptimeMillis() + 5_000
-            while (manager.activeNotifications.any { it.id == 43 } && android.os.SystemClock.uptimeMillis() < deadline) {
+            while (manager.activeNotifications.any { it.id == 43 || it.id == IconPackBuildService.INSTALL_CONFIRMATION_ID } &&
+                android.os.SystemClock.uptimeMillis() < deadline) {
                 android.os.SystemClock.sleep(25)
             }
-            assertTrue("Successful completion must clear obsolete install notices", manager.activeNotifications.none { it.id == 43 })
+            assertTrue("Successful completion must clear obsolete install notices", manager.activeNotifications.none {
+                it.id == 43 || it.id == IconPackBuildService.INSTALL_CONFIRMATION_ID
+            })
         }
         manager.cancel(43)
         try {
@@ -76,14 +79,19 @@ class PackResultNotificationTest {
             callback(PackageInstaller.STATUS_SUCCESS, 1473)
             scheduler.cancel(IconPackSelectionJobService.JOB_ID)
             awaitCleared()
+            NotificationPreferences.setEnabled(context, false)
             callback(PackageInstaller.STATUS_PENDING_USER_ACTION, 1474)
             assertEquals(BuildCoordinator.Phase.WAITING_CONFIRMATION, BuildCoordinator.state.phase)
-            assertNotNull(awaitIcon(R.drawable.ic_notification_waiting).contentIntent)
+            val approval = awaitIcon(R.drawable.ic_notification_waiting, IconPackBuildService.INSTALL_CONFIRMATION_ID)
+            assertNotNull(approval.contentIntent)
+            // Some Android builds impose their own default timeout on non-ongoing notifications.
+            assertTrue(approval.timeoutAfter == 0L || approval.timeoutAfter > 60_000)
             callback(PackageInstaller.STATUS_SUCCESS, 1474)
             scheduler.cancel(IconPackSelectionJobService.JOB_ID)
             awaitCleared()
         } finally {
             manager.cancel(43)
+            IconPackBuildService.cancelInstallConfirmation(context)
             scheduler.cancel(IconPackSelectionJobService.JOB_ID)
             saved.forEach { (name, values) -> restore(prefs(name), values) }
             BuildCoordinator.update { state }

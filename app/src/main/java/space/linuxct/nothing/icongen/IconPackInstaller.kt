@@ -93,6 +93,7 @@ object IconPackInstaller {
         } else "All generation stopped"
         prefs.edit().putString(STAGE, STOPPED).putString(STATUS, message)
             .putInt(SESSION, -1).remove(CONFIRMATION).remove(REAPPLY_VERSION).commit()
+        IconPackBuildService.cancelInstallConfirmation(context)
         statusListener?.invoke(message)
         return message
     }
@@ -331,7 +332,9 @@ object IconPackInstaller {
                     putLong(REAPPLY_REQUEST, prefs.getLong(REAPPLY_REQUEST, 0) + 1)
                 }
             }.commit()) { "Could not persist installation result" }
+        IconPackBuildService.cancelInstallConfirmation(context)
         if (verified) {
+            BuildCoordinator.recordPackInstall(context)
             IconPackSelectionJobService.scheduleConfirmedInstall(context)
             prefs.getString(SNAPSHOT, null)?.let { PackageChangeMonitor.installed(context, it) }
         }
@@ -373,9 +376,7 @@ object IconPackInstaller {
                             confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
                         // A direct activity PendingIntent is user-initiated, not a background launch.
-                        IconPackBuildService.postResult(context, "Confirm icon pack installation",
-                            "Tap to approve the Android installer, or open the generator",
-                            IconPackBuildService.ResultKind.ACTION_REQUIRED, action)
+                        IconPackBuildService.postInstallConfirmation(context, action)
                     }
                     PackageInstaller.STATUS_SUCCESS -> finish(context, true, "Icon pack installed")
                     else -> finish(context, false,

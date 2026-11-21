@@ -6,6 +6,7 @@ import android.app.job.JobWorkItem
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.os.SystemClock
 import android.util.Log
 import java.util.concurrent.CancellationException
 
@@ -39,6 +40,9 @@ object BuildCoordinator {
     private const val DEFER_UNTIL = "defer_until"
     private const val FIRST_SETTLE_MS = 5_000L
     private const val BURST_SETTLE_MS = 30_000L
+    // Android throttles silent updates of the same package for 30 seconds of uptime.
+    private const val SILENT_INSTALL_COOLDOWN_MS = 31_000L
+    private const val LAST_PACK_INSTALL_UPTIME = "last_pack_install_uptime"
     private var active: Cancellation? = null
     private var activePreparation: Cancellation? = null
     const val JOB_ID = 4401
@@ -165,7 +169,8 @@ object BuildCoordinator {
     /** A dispatched timer may be older than the latest package change; honor the saved deadline. */
     @Synchronized fun settled(context: Context) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        if (!prefs.contains(DEFER_UNTIL) || prefs.getLong(REQUESTED, 0) <= prefs.getLong(COMPLETED, 0)) return
+        if ((!prefs.contains(DEFER_UNTIL) && !prefs.contains(LAST_PACK_INSTALL_UPTIME)) ||
+            prefs.getLong(REQUESTED, 0) <= prefs.getLong(COMPLETED, 0)) return
         if (System.currentTimeMillis() >= prefs.getLong(DEFER_UNTIL, 0)) {
             prefs.edit().remove(DEFER_UNTIL).commit()
         }
@@ -220,11 +225,25 @@ object BuildCoordinator {
         Log.d("BuildCoordinator", "Acknowledged generation=$request")
     }
 
+    internal fun recordPackInstall(context: Context) {
+        check(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putLong(LAST_PACK_INSTALL_UPTIME, SystemClock.uptimeMillis()).commit()) {
+            "Could not persist icon pack install cooldown"
+        }
+    }
+
+    private fun delayBeforeBuild(prefs: android.content.SharedPreferences): Long {
+        val uptime = SystemClock.uptimeMillis()
+        val lastInstall = prefs.getLong(LAST_PACK_INSTALL_UPTIME, -1)
+        val cooldown = if (lastInstall in 0..uptime) SILENT_INSTALL_COOLDOWN_MS - (uptime - lastInstall) else 0
+        return maxOf(0, cooldown, prefs.getLong(DEFER_UNTIL, 0) - System.currentTimeMillis())
+    }
+
     /** Always schedule from the durable deadline, including recovery and early worker delivery.
      *  Enqueue immediate work rather than replacing a running build; delayed work uses its own job. */
     private fun schedule(context: Context) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val settleMs = (prefs.getLong(DEFER_UNTIL, 0) - System.currentTimeMillis()).coerceAtLeast(0L)
+        val settleMs = delayBeforeBuild(prefs)
         val scheduler = context.getSystemService(JobScheduler::class.java)
         val component = ComponentName(context, IconPackBuildJobService::class.java)
         val result = if (settleMs > 0) scheduler.schedule(JobInfo.Builder(SETTLE_JOB_ID, component)
@@ -271,8 +290,8 @@ object BuildCoordinator {
                 val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 target = prefs.getLong(REQUESTED, 0)
                 if (target <= prefs.getLong(COMPLETED, 0)) return
-                // An early/redelivered worker must leave a future wakeup before completing its item.
-                if (System.currentTimeMillis() < prefs.getLong(DEFER_UNTIL, 0)) {
+                // Early delivery (including after deep sleep) must not skip the uptime cooldown.
+                if (delayBeforeBuild(prefs) > 0) {
                     schedule(context)
                     return
                 }

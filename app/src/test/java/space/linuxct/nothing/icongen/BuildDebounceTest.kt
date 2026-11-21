@@ -28,6 +28,26 @@ class BuildDebounceTest {
         BuildCoordinator.reset()
     }
 
+    @Test fun rapidUpdateKeepsItsRequestAndRearmsUntilThePlatformCooldownExpires() {
+        BuildCoordinator.recordPackInstall(context)
+        BuildCoordinator.start(context, "package:test")
+        val timer = scheduler.getPendingJob(BuildCoordinator.SETTLE_JOB_ID)!!
+        assertTrue(timer.minLatencyMillis > 30_000)
+        assertNull(scheduler.getPendingJob(BuildCoordinator.JOB_ID))
+
+        scheduler.cancelAll()
+        BuildCoordinator.runPending(context) { false }
+        assertNotNull(scheduler.getPendingJob(BuildCoordinator.SETTLE_JOB_ID))
+        assertEquals(0L, queue.getLong("completed", 0))
+        assertEquals(1L, queue.getLong("requested", 0))
+
+        org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(31_001))
+        queue.edit().putLong("defer_until", System.currentTimeMillis() - 1).commit()
+        BuildCoordinator.settled(context)
+        assertNotNull(scheduler.getPendingJob(BuildCoordinator.JOB_ID))
+        assertEquals(0L, queue.getLong("completed", 0))
+    }
+
     @After fun tearDown() {
         scheduler.cancelAll()
         BuildCoordinator.reset()
